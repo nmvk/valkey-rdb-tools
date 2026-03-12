@@ -1,0 +1,14 @@
+[package]
+name = "valkey-rdb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI tool to export Valkey/Redis RDB files to Parquet, CSV, and JSON"
+
+[[bin]]
+name = "valkey-rdb"
+path = "src/main.rs"
+
+[dependencies]
+rdb-parser = { path = "../rdb-parser" }
+rdb-to-arrow = { path = "../rdb-to-arrow" }

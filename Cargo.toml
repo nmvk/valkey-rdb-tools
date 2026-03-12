@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/rdb-parser",
+    "crates/rdb-to-arrow",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"

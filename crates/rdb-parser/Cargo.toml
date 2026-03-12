@@ -1,0 +1,8 @@
+[package]
+name = "rdb-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parse Valkey/Redis RDB files into typed entries"
+
+[dependencies]
