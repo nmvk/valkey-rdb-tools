@@ -1,7 +1,11 @@
-pub mod opcodes;
+pub(crate) mod compact;
+pub(crate) mod crc64;
+pub(crate) mod intset;
+pub(crate) mod listpack;
+pub(crate) mod opcodes;
 pub mod reader;
 pub mod types;
+pub(crate) mod ziplist;
 
-// Re-export main types for convenience
 pub use reader::RdbReader;
 pub use types::{HashField, RdbEntry, RdbError, RdbHeader, RdbMagic, RdbMetadata, RdbValue};

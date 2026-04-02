@@ -1,6 +1,6 @@
 // RDB entry types — the typed structs yielded by the parser
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// RDB magic string type — REDIS (legacy) or VALKEY (9.0+).
@@ -29,7 +29,7 @@ pub struct RdbHeader {
 /// File-level metadata extracted from AUX fields.
 #[derive(Debug, Clone, Default)]
 pub struct RdbMetadata {
-    pub aux: HashMap<String, String>,
+    pub aux: BTreeMap<String, String>,
 }
 
 impl RdbMetadata {
@@ -67,6 +67,7 @@ pub struct HashField {
 
 /// The value portion of an RDB key-value entry.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum RdbValue {
     /// Simple string or integer-encoded value.
     String(Vec<u8>),
@@ -126,6 +127,7 @@ impl RdbEntry {
 
 /// Errors returned by the RDB parser.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RdbError {
     /// I/O error from the underlying reader.
     Io(std::io::Error),
@@ -162,3 +164,76 @@ impl fmt::Display for RdbError {
 }
 
 impl std::error::Error for RdbError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_metadata(pairs: &[(&str, &str)]) -> RdbMetadata {
+        let mut m = RdbMetadata::default();
+        for (k, v) in pairs {
+            m.aux.insert(k.to_string(), v.to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn test_server_version_valkey() {
+        let m = make_metadata(&[("valkey-ver", "9.0.1")]);
+        assert_eq!(m.server_version(), Some("9.0.1"));
+    }
+
+    #[test]
+    fn test_server_version_redis_fallback() {
+        let m = make_metadata(&[("redis-ver", "7.2.4")]);
+        assert_eq!(m.server_version(), Some("7.2.4"));
+    }
+
+    #[test]
+    fn test_server_version_valkey_takes_precedence() {
+        let m = make_metadata(&[("valkey-ver", "9.0.0"), ("redis-ver", "7.2.4")]);
+        assert_eq!(m.server_version(), Some("9.0.0"));
+    }
+
+    #[test]
+    fn test_server_version_missing() {
+        let m = RdbMetadata::default();
+        assert_eq!(m.server_version(), None);
+    }
+
+    #[test]
+    fn test_ctime() {
+        let m = make_metadata(&[("ctime", "1700000000")]);
+        assert_eq!(m.ctime(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn test_ctime_invalid() {
+        let m = make_metadata(&[("ctime", "not_a_number")]);
+        assert_eq!(m.ctime(), None);
+    }
+
+    #[test]
+    fn test_used_mem() {
+        let m = make_metadata(&[("used-mem", "1073741824")]);
+        assert_eq!(m.used_mem(), Some(1_073_741_824));
+    }
+
+    #[test]
+    fn test_repl_id() {
+        let m = make_metadata(&[("repl-id", "abc123def456")]);
+        assert_eq!(m.repl_id(), Some("abc123def456"));
+    }
+
+    #[test]
+    fn test_repl_offset() {
+        let m = make_metadata(&[("repl-offset", "-1")]);
+        assert_eq!(m.repl_offset(), Some(-1));
+    }
+
+    #[test]
+    fn test_repl_offset_missing() {
+        let m = RdbMetadata::default();
+        assert_eq!(m.repl_offset(), None);
+    }
+}

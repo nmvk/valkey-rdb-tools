@@ -3,7 +3,23 @@ name = "rdb-to-arrow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 description = "Convert parsed RDB entries into Arrow RecordBatches"
+
+[features]
+default = ["parquet", "csv", "json"]
+parquet = ["dep:parquet"]
+csv = ["dep:arrow-csv"]
+json = ["dep:arrow-json"]
 
 [dependencies]
 rdb-parser = { path = "../rdb-parser" }
+arrow = { workspace = true, features = ["ipc"] }
+arrow-csv = { workspace = true, optional = true }
+arrow-json = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true, features = ["arrow", "zstd", "snap", "lz4"] }
+
+[dev-dependencies]
+parquet = { workspace = true, features = ["arrow"] }
+bytes = "1"

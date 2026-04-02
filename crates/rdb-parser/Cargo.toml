@@ -3,6 +3,8 @@ name = "rdb-parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 description = "Parse Valkey/Redis RDB files into typed entries"
 
 [dependencies]

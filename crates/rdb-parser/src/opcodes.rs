@@ -59,7 +59,7 @@ pub const RDB_ENC_LZF: u8 = 3;
 
 /// Returns true if the type byte is a valid RDB object type.
 pub fn is_object_type(t: u8) -> bool {
-    (t <= 7 && t != 8) || (t >= 9 && t <= RDB_TYPE_HASH_2)
+    t <= 7 || (9..=RDB_TYPE_HASH_2).contains(&t)
 }
 
 /// Returns the logical type name for a given RDB type code.
@@ -79,6 +79,34 @@ pub fn type_name(t: u8) -> &'static str {
         _ => "unknown",
     }
 }
+
+/// All valid RDB object type codes, in order.
+/// Used by tests to verify is_object_type stays in sync with the match arms.
+#[cfg(test)]
+const ALL_TYPE_CODES: [u8; 22] = [
+    RDB_TYPE_STRING,
+    RDB_TYPE_LIST,
+    RDB_TYPE_SET,
+    RDB_TYPE_ZSET,
+    RDB_TYPE_HASH,
+    RDB_TYPE_ZSET_2,
+    RDB_TYPE_MODULE_PRE_GA,
+    RDB_TYPE_MODULE_2,
+    RDB_TYPE_HASH_ZIPMAP,
+    RDB_TYPE_LIST_ZIPLIST,
+    RDB_TYPE_SET_INTSET,
+    RDB_TYPE_ZSET_ZIPLIST,
+    RDB_TYPE_HASH_ZIPLIST,
+    RDB_TYPE_LIST_QUICKLIST,
+    RDB_TYPE_STREAM_LISTPACKS,
+    RDB_TYPE_HASH_LISTPACK,
+    RDB_TYPE_ZSET_LISTPACK,
+    RDB_TYPE_LIST_QUICKLIST_2,
+    RDB_TYPE_STREAM_LISTPACKS_2,
+    RDB_TYPE_SET_LISTPACK,
+    RDB_TYPE_STREAM_LISTPACKS_3,
+    RDB_TYPE_HASH_2,
+];
 
 /// Returns the encoding name for a given RDB type code.
 pub fn encoding_name(t: u8) -> &'static str {
@@ -105,5 +133,69 @@ pub fn encoding_name(t: u8) -> &'static str {
         RDB_TYPE_HASH_2 => "hashtable",
         RDB_TYPE_MODULE_PRE_GA | RDB_TYPE_MODULE_2 => "module",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_object_type_accepts_all_known_types() {
+        for &t in &ALL_TYPE_CODES {
+            assert!(
+                is_object_type(t),
+                "is_object_type should accept type code {}",
+                t
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_object_type_rejects_non_types() {
+        // Type 8 is explicitly unused
+        assert!(!is_object_type(8));
+        // Opcodes should not be accepted
+        for &op in &[
+            RDB_OPCODE_AUX,
+            RDB_OPCODE_SELECTDB,
+            RDB_OPCODE_EOF,
+            RDB_OPCODE_EXPIRETIME_MS,
+            RDB_OPCODE_RESIZEDB,
+            RDB_OPCODE_IDLE,
+            RDB_OPCODE_FREQ,
+            RDB_OPCODE_FUNCTION2,
+            RDB_OPCODE_MODULE_AUX,
+        ] {
+            assert!(
+                !is_object_type(op),
+                "is_object_type should reject opcode {}",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_name_covers_all_known_types() {
+        for &t in &ALL_TYPE_CODES {
+            assert_ne!(
+                type_name(t),
+                "unknown",
+                "type_name missing coverage for type code {}",
+                t
+            );
+        }
+    }
+
+    #[test]
+    fn test_encoding_name_covers_all_known_types() {
+        for &t in &ALL_TYPE_CODES {
+            assert_ne!(
+                encoding_name(t),
+                "unknown",
+                "encoding_name missing coverage for type code {}",
+                t
+            );
+        }
     }
 }

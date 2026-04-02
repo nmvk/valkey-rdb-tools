@@ -3,6 +3,12 @@ members = [
     "crates/rdb-parser",
     "crates/rdb-to-arrow",
     "crates/cli",
+    "crates/python",
+]
+default-members = [
+    "crates/rdb-parser",
+    "crates/rdb-to-arrow",
+    "crates/cli",
 ]
 resolver = "2"
 
@@ -10,3 +16,12 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
+rust-version = "1.75"
+repository = "https://github.com/valkey-io/valkey-rdb-tools"
+
+[workspace.dependencies]
+arrow = { version = "55", default-features = false }
+arrow-csv = { version = "55" }
+arrow-json = { version = "55" }
+parquet = { version = "55", default-features = false }
+pyo3 = { version = "0.24" }

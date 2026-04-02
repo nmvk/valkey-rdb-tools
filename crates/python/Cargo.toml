@@ -1,20 +1,19 @@
 [package]
-name = "valkey-rdb-cli"
+name = "valkey-rdb-python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "CLI tool to export Valkey/Redis RDB files to Parquet, CSV, and JSON"
+description = "Python bindings for valkey-rdb-tools via PyO3"
 
-[[bin]]
-name = "valkey-rdb"
-path = "src/main.rs"
+[lib]
+name = "valkey_rdb"
+crate-type = ["cdylib"]
 
 [dependencies]
 rdb-parser = { path = "../rdb-parser" }
 rdb-to-arrow = { path = "../rdb-to-arrow" }
-clap = { version = "4", features = ["derive"] }
-serde_json = "1"
+pyo3 = { workspace = true, features = ["extension-module"] }
+arrow = { workspace = true, features = ["pyarrow"] }
 parquet = { workspace = true }
-glob-match = "0.2"
