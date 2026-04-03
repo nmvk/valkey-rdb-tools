@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -58,9 +59,9 @@ where
 
     for batch_result in batches {
         let typed_batch = batch_result?;
-        let writer = match writers.get_mut(&typed_batch.tag) {
-            Some(w) => w,
-            None => {
+        let writer = match writers.entry(typed_batch.tag) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
                 let w = writer_factory(typed_batch.tag)?;
                 let schema = if config.file_metadata.is_empty() {
                     schema_for(typed_batch.tag)
@@ -69,8 +70,7 @@ where
                 };
                 let arrow_writer =
                     ArrowWriter::try_new(w, std::sync::Arc::new(schema), Some(props.clone()))?;
-                writers.insert(typed_batch.tag, arrow_writer);
-                writers.get_mut(&typed_batch.tag).unwrap()
+                e.insert(arrow_writer)
             }
         };
         writer.write(&typed_batch.batch)?;
@@ -114,14 +114,13 @@ where
 
     for batch_result in batches {
         let typed_batch = batch_result?;
-        let writer = match writers.get_mut(&typed_batch.tag) {
-            Some(w) => w,
-            None => {
+        let writer = match writers.entry(typed_batch.tag) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
                 let w = writer_factory(typed_batch.tag)?;
                 let schema = schema_for(typed_batch.tag);
                 let ipc_writer = IpcFileWriter::try_new(w, &schema)?;
-                writers.insert(typed_batch.tag, ipc_writer);
-                writers.get_mut(&typed_batch.tag).unwrap()
+                e.insert(ipc_writer)
             }
         };
         writer.write(&typed_batch.batch)?;
@@ -149,13 +148,12 @@ where
 
     for batch_result in batches {
         let typed_batch = batch_result?;
-        let writer = match writers.get_mut(&typed_batch.tag) {
-            Some(w) => w,
-            None => {
+        let writer = match writers.entry(typed_batch.tag) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
                 let w = writer_factory(typed_batch.tag)?;
                 let csv_writer = arrow_csv::writer::Writer::new(w);
-                writers.insert(typed_batch.tag, csv_writer);
-                writers.get_mut(&typed_batch.tag).unwrap()
+                e.insert(csv_writer)
             }
         };
         writer.write(&typed_batch.batch)?;
@@ -183,13 +181,12 @@ where
 
     for batch_result in batches {
         let typed_batch = batch_result?;
-        let writer = match writers.get_mut(&typed_batch.tag) {
-            Some(w) => w,
-            None => {
+        let writer = match writers.entry(typed_batch.tag) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
                 let w = writer_factory(typed_batch.tag)?;
                 let json_writer = arrow_json::writer::LineDelimitedWriter::new(w);
-                writers.insert(typed_batch.tag, json_writer);
-                writers.get_mut(&typed_batch.tag).unwrap()
+                e.insert(json_writer)
             }
         };
         writer.write(&typed_batch.batch)?;

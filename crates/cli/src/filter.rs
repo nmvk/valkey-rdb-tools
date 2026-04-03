@@ -36,8 +36,10 @@ impl EntryFilter {
     /// types to avoid running geo/HLL detection on every entry.
     fn matches_type(&self, entry: &RdbEntry, tag: TypeTag) -> bool {
         match tag {
-            // Non-virtual types: check the RDB value variant directly
-            TypeTag::String => matches!(entry.value, RdbValue::String(_)),
+            // String but not HLL — need detection
+            TypeTag::String => {
+                matches!(rdb_to_arrow::type_tag_for(entry), Some(TypeTag::String))
+            }
             TypeTag::List => matches!(entry.value, RdbValue::List(_)),
             TypeTag::Set => matches!(entry.value, RdbValue::Set(_)),
             TypeTag::SortedSet => {

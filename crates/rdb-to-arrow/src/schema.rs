@@ -67,6 +67,12 @@ impl TypeTag {
     }
 }
 
+impl std::fmt::Display for TypeTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Determines the TypeTag for an RDB entry. Returns None for unsupported types (stream, module).
 ///
 /// Performs virtual type detection: sorted sets where all scores are valid 52-bit geohashes

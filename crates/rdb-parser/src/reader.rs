@@ -793,10 +793,6 @@ impl<R: Read> RdbReader<R> {
     }
 }
 
-// --- Header parsing ---
-
-/// Read and validate the 9-byte RDB header.
-///
 /// Decode compact entries (listpack or ziplist) as hash field-value pairs.
 fn decode_hash_pairs(
     entries: Vec<crate::compact::CompactEntry>,
@@ -1305,20 +1301,39 @@ mod tests {
     fn test_fixture_hash_field_ttl() {
         let f = std::fs::File::open("../../tests/fixtures/hash_field_ttl.rdb").unwrap();
         let reader = RdbReader::new(f).unwrap();
-        let mut found_hash = false;
-        for entry in reader {
-            let e = entry.unwrap();
-            if e.type_name() == "hash" {
-                found_hash = true;
-                match &e.value {
-                    RdbValue::Hash(fields) => {
-                        assert!(!fields.is_empty(), "hash should have fields");
-                    }
-                    other => panic!("expected Hash, got {:?}", other),
-                }
-            }
-        }
-        assert!(found_hash, "hash_field_ttl.rdb should have hash entries");
+        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
+
+        let hashes: Vec<_> = entries.iter().filter(|e| e.type_name() == "hash").collect();
+        assert_eq!(hashes.len(), 2, "expected 2 hash keys");
+
+        // hfe_hash: HASH_2 with per-field TTL
+        let hfe = hashes.iter().find(|e| e.key == b"hfe_hash").expect("hfe_hash key");
+        let fields = match &hfe.value {
+            RdbValue::Hash(f) => f,
+            other => panic!("expected Hash, got {:?}", other),
+        };
+        assert_eq!(fields.len(), 3);
+
+        let persist = fields.iter().find(|f| f.field == b"field_persist").unwrap();
+        assert_eq!(persist.value, b"no expiry");
+        assert_eq!(persist.expiry_ms, None);
+
+        let future = fields.iter().find(|f| f.field == b"field_future").unwrap();
+        assert_eq!(future.value, b"expires later");
+        assert_eq!(future.expiry_ms, Some(4_102_444_800_000));
+
+        let short = fields.iter().find(|f| f.field == b"field_short").unwrap();
+        assert_eq!(short.value, b"expires soon");
+        assert_eq!(short.expiry_ms, Some(4_102_444_800_000));
+
+        // normal_hash: regular hash, no per-field TTL
+        let normal = hashes.iter().find(|e| e.key == b"normal_hash").expect("normal_hash key");
+        let fields = match &normal.value {
+            RdbValue::Hash(f) => f,
+            other => panic!("expected Hash, got {:?}", other),
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|f| f.expiry_ms.is_none()), "normal hash should have no field TTLs");
     }
 
     // --- Fixture: streams.rdb stays aligned ---

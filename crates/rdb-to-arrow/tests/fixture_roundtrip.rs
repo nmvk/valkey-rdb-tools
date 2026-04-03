@@ -204,6 +204,56 @@ fn multi_db_roundtrip() {
     }
 }
 
+/// Parse hash_field_ttl.rdb and verify per-field expiry survives the full
+/// pipeline through Arrow and Parquet. This exercises HASH_2 (type 22)
+/// which carries per-field TTL — a Valkey-specific encoding.
+#[test]
+fn hash_field_ttl_roundtrip() {
+    let (by_type, meta) = collect_batches(&fixture_path("hash_field_ttl.rdb"));
+    let file_meta = metadata_from_rdb(&meta);
+
+    let hash_batches = by_type.get(&TypeTag::Hash).expect("should have hashes");
+    // hfe_hash (3 fields) + normal_hash (2 fields) = 5 rows
+    assert_eq!(total_rows(hash_batches), 5);
+
+    let (pq_batches, _) = parquet_roundtrip(TypeTag::Hash, hash_batches, &file_meta);
+    assert_eq!(total_rows(&pq_batches), 5);
+    assert_eq!(pq_batches[0].num_columns(), 11); // 8 common + field + field_value + field_expiry_ms
+
+    // Verify per-field expiry values survived the roundtrip.
+    let batch = &pq_batches[0];
+    let key_col = batch.column(1).as_binary::<i32>();
+    let field_col = batch.column(8).as_binary::<i32>();
+    let field_expiry_col = batch.column(10).as_primitive::<arrow::datatypes::Int64Type>();
+
+    let mut found_persist = false;
+    let mut found_with_ttl = false;
+    let mut found_normal = false;
+
+    for i in 0..batch.num_rows() {
+        let key = key_col.value(i);
+        let field = field_col.value(i);
+
+        if key == b"hfe_hash" && field == b"field_persist" {
+            assert!(field_expiry_col.is_null(i), "field_persist should have no TTL");
+            found_persist = true;
+        }
+        if key == b"hfe_hash" && field == b"field_future" {
+            assert!(!field_expiry_col.is_null(i), "field_future should have TTL");
+            assert_eq!(field_expiry_col.value(i), 4_102_444_800_000i64);
+            found_with_ttl = true;
+        }
+        if key == b"normal_hash" {
+            assert!(field_expiry_col.is_null(i), "normal_hash fields should have no TTL");
+            found_normal = true;
+        }
+    }
+
+    assert!(found_persist, "should find hfe_hash.field_persist");
+    assert!(found_with_ttl, "should find hfe_hash.field_future with TTL");
+    assert!(found_normal, "should find normal_hash fields");
+}
+
 /// Parse encodings.rdb which has many different encoding types and sizes.
 #[test]
 fn encodings_rdb_all_types_parsed() {
