@@ -9,6 +9,27 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Parse a human-friendly byte size like "10mb", "512kb", "1gb", or raw bytes "1048576".
+fn parse_byte_size(s: &str) -> Result<usize, String> {
+    let s = s.trim().to_ascii_lowercase();
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix("gb") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = s.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    let n: usize = num_str.trim().parse().map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("value must be > 0".to_string());
+    }
+    Ok(n * multiplier)
+}
+
 #[derive(Parser)]
 #[command(name = "valkey-rdb", about = "Export Valkey/Redis RDB files to columnar formats")]
 pub struct Cli {
@@ -72,6 +93,14 @@ pub struct ExportArgs {
     /// Disable collection chunking (read entire collections into memory)
     #[arg(long, conflicts_with = "max_key_elements")]
     pub no_chunking: bool,
+
+    /// Byte budget per builder batch — flush when exceeded (e.g. 10mb, 50mb)
+    #[arg(long, value_parser = parse_byte_size)]
+    pub batch_bytes: Option<usize>,
+
+    /// Skip entries larger than this size (e.g. 1mb, 10mb)
+    #[arg(long, value_parser = parse_byte_size)]
+    pub max_entry_bytes: Option<usize>,
 }
 
 #[derive(Parser)]

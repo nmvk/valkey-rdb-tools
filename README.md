@@ -52,6 +52,9 @@ cat dump.rdb | valkey-rdb export - -o output/
 
 # Custom compression
 valkey-rdb export dump.rdb --compression snappy
+
+# Bound memory: flush builders at ~50 MB, skip entries over 10 MB
+valkey-rdb export dump.rdb --batch-bytes 50mb --max-entry-bytes 10mb
 ```
 
 ### schema
@@ -121,7 +124,7 @@ Streams and modules are skipped during parsing.
 
 ### Design choices
 
-- **Streaming** — Never loads an entire RDB into memory. Large plain-encoded collections are chunked automatically (default: 50K elements) to bound peak memory.
+- **Streaming** — Never loads an entire RDB into memory. Large plain-encoded collections are chunked automatically (default: 50K elements) to bound peak memory. Use `--batch-bytes` to cap builder memory and `--max-entry-bytes` to skip oversized keys.
 - **Export only** — No RDB writing. RDB is Valkey's internal format; writing it externally is fragile.
 - **Lean** — Zero cloud dependencies. No runtime config files. Bring your own upload logic.
 

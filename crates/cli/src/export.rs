@@ -74,6 +74,8 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
     let filtered = FilteredEntries::new(reader, filter);
     let batcher = ArrowBatcher::new(BatcherConfig {
         batch_size: args.batch_size,
+        batch_bytes: args.batch_bytes,
+        max_entry_bytes: args.max_entry_bytes,
     });
     let raw_batches = batcher.process(filtered);
 

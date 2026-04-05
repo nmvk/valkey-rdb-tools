@@ -8,6 +8,8 @@ use crate::builders::{
     SortedSetBatchBuilder, StringBatchBuilder,
 };
 use crate::error::ArrowConvertError;
+use rdb_parser::{RdbEntry, RdbValue};
+
 use crate::schema::{type_tag_for, is_geo_entry, TypeTag};
 
 /// Configuration for the Arrow batcher.
@@ -18,14 +20,36 @@ pub struct BatcherConfig {
     /// collection types (list, set, hash, zset) expand to one row per element,
     /// a single large collection may produce a batch larger than this value.
     pub batch_size: usize,
+    /// Byte budget per builder. When a builder's accumulated variable-length
+    /// data exceeds this threshold, it is flushed. `None` disables byte-budget
+    /// flushing (only row-count is used).
+    pub batch_bytes: Option<usize>,
+    /// Skip RDB entries whose estimated in-memory size exceeds this threshold.
+    /// Prevents a single large key from blowing up memory. `None` disables.
+    pub max_entry_bytes: Option<usize>,
 }
 
 impl Default for BatcherConfig {
     fn default() -> Self {
         Self {
             batch_size: 65_536,
+            batch_bytes: None,
+            max_entry_bytes: None,
         }
     }
+}
+
+/// Estimate the variable-length data size of an RDB entry (key + value payload).
+fn estimate_entry_bytes(entry: &RdbEntry) -> usize {
+    entry.key.len()
+        + match &entry.value {
+            RdbValue::String(v) => v.len(),
+            RdbValue::List(elems) => elems.iter().map(|e| e.len()).sum(),
+            RdbValue::Set(members) => members.iter().map(|m| m.len()).sum(),
+            RdbValue::SortedSet(pairs) => pairs.iter().map(|(m, _)| m.len() + 8).sum(),
+            RdbValue::Hash(fields) => fields.iter().map(|f| f.field.len() + f.value.len()).sum(),
+            _ => 0,
+        }
 }
 
 /// A RecordBatch tagged with its logical type.
@@ -79,6 +103,13 @@ impl ArrowBatcher {
             Some(t) => t,
             None => return Ok(vec![]), // skip unsupported types
         };
+
+        // Skip entries that exceed the max entry size
+        if let Some(max) = self.config.max_entry_bytes {
+            if estimate_entry_bytes(entry) > max {
+                return Ok(vec![]);
+            }
+        }
 
         match tag {
             TypeTag::String => self.string.push(entry),
@@ -136,16 +167,18 @@ impl ArrowBatcher {
         tag: TypeTag,
         out: &mut Vec<TypedBatch>,
     ) -> Result<(), ArrowConvertError> {
-        let (len, threshold) = match tag {
-            TypeTag::String => (self.string.len(), self.config.batch_size),
-            TypeTag::List => (self.list.len(), self.config.batch_size),
-            TypeTag::Set => (self.set.len(), self.config.batch_size),
-            TypeTag::SortedSet => (self.zset.len(), self.config.batch_size),
-            TypeTag::Hash => (self.hash.len(), self.config.batch_size),
-            TypeTag::Geo => (self.geo.len(), self.config.batch_size),
-            TypeTag::HyperLogLog => (self.hll.len(), self.config.batch_size),
+        let (len, bytes) = match tag {
+            TypeTag::String => (self.string.len(), self.string.data_bytes()),
+            TypeTag::List => (self.list.len(), self.list.data_bytes()),
+            TypeTag::Set => (self.set.len(), self.set.data_bytes()),
+            TypeTag::SortedSet => (self.zset.len(), self.zset.data_bytes()),
+            TypeTag::Hash => (self.hash.len(), self.hash.data_bytes()),
+            TypeTag::Geo => (self.geo.len(), self.geo.data_bytes()),
+            TypeTag::HyperLogLog => (self.hll.len(), self.hll.data_bytes()),
         };
-        if len >= threshold {
+        let row_exceeded = len >= self.config.batch_size;
+        let bytes_exceeded = self.config.batch_bytes.is_some_and(|max| bytes >= max);
+        if row_exceeded || bytes_exceeded {
             self.flush_tag(tag, out)?;
         }
         Ok(())
@@ -252,7 +285,7 @@ mod tests {
     }
 
     fn config(batch_size: usize) -> BatcherConfig {
-        BatcherConfig { batch_size }
+        BatcherConfig { batch_size, ..Default::default() }
     }
 
     #[test]
@@ -412,6 +445,112 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].tag, TypeTag::SortedSet);
+    }
+
+    #[test]
+    fn batch_bytes_triggers_flush() {
+        // Set batch_bytes low enough that a few entries trigger a flush before batch_size.
+        let mut batcher = ArrowBatcher::new(BatcherConfig {
+            batch_size: 1000, // high row limit — won't trigger
+            batch_bytes: Some(20), // ~20 bytes budget
+            max_entry_bytes: None,
+        });
+
+        // Each string entry contributes key.len() + value.len() bytes.
+        // "k0"(2) + "value"(5) = 7, "k1" = 7, "k2" = 7 → cumulative 21 ≥ 20 → flush.
+        for i in 0..2 {
+            let key = format!("k{i}");
+            let batches = batcher.push(&string_entry(key.as_bytes(), b"value")).unwrap();
+            assert!(batches.is_empty(), "no flush yet at entry {i}");
+        }
+        // Third entry should trigger the flush
+        let batches = batcher.push(&string_entry(b"k2", b"value")).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].tag, TypeTag::String);
+        assert_eq!(batches[0].batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn batch_bytes_resets_after_flush() {
+        let mut batcher = ArrowBatcher::new(BatcherConfig {
+            batch_size: 1000,
+            batch_bytes: Some(15),
+            max_entry_bytes: None,
+        });
+
+        // Push 2 entries (~14 bytes), then a 3rd triggers flush (~21 bytes)
+        batcher.push(&string_entry(b"k0", b"value")).unwrap();
+        batcher.push(&string_entry(b"k1", b"value")).unwrap();
+        let batches = batcher.push(&string_entry(b"k2", b"value")).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        // After flush, byte counter resets. Push 2 more — should NOT flush.
+        let batches = batcher.push(&string_entry(b"k3", b"value")).unwrap();
+        assert!(batches.is_empty());
+        let batches = batcher.flush().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn max_entry_bytes_skips_large_entries() {
+        let mut batcher = ArrowBatcher::new(BatcherConfig {
+            batch_size: 100,
+            batch_bytes: None,
+            max_entry_bytes: Some(50), // skip entries > 50 bytes
+        });
+
+        // Small entry: key(2) + value(5) = 7 → allowed
+        batcher.push(&string_entry(b"k1", b"hello")).unwrap();
+
+        // Large entry: key(2) + value(100) = 102 → skipped
+        let big_val = vec![b'x'; 100];
+        batcher.push(&string_entry(b"k2", &big_val)).unwrap();
+
+        let batches = batcher.flush().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].batch.num_rows(), 1); // only the small entry
+    }
+
+    #[test]
+    fn max_entry_bytes_allows_entries_at_threshold() {
+        let mut batcher = ArrowBatcher::new(BatcherConfig {
+            batch_size: 100,
+            batch_bytes: None,
+            max_entry_bytes: Some(10), // skip entries > 10 bytes
+        });
+
+        // Exactly 10 bytes: key(2) + value(8) = 10 → allowed
+        batcher.push(&string_entry(b"k1", b"12345678")).unwrap();
+
+        // 11 bytes: key(2) + value(9) = 11 → skipped
+        batcher.push(&string_entry(b"k2", b"123456789")).unwrap();
+
+        let batches = batcher.flush().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn estimate_entry_bytes_string() {
+        let entry = string_entry(b"mykey", b"myvalue");
+        assert_eq!(estimate_entry_bytes(&entry), 5 + 7); // key + value
+    }
+
+    #[test]
+    fn estimate_entry_bytes_list() {
+        let entry = list_entry(b"lk", vec![b"aaa".to_vec(), b"bb".to_vec()]);
+        assert_eq!(estimate_entry_bytes(&entry), 2 + 3 + 2); // key + elem1 + elem2
+    }
+
+    #[test]
+    fn estimate_entry_bytes_sorted_set() {
+        let entry = geo_entry(
+            b"zk",
+            vec![(b"member".to_vec(), 1.0)],
+        );
+        // key(2) + member(6) + 8 (f64) = 16
+        assert_eq!(estimate_entry_bytes(&entry), 2 + 6 + 8);
     }
 
     #[test]

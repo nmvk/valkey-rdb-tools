@@ -78,6 +78,7 @@ pub(crate) struct StringBatchBuilder {
     common: CommonColumnsBuilder,
     value: BinaryBuilder,
     len: usize,
+    data_bytes: usize,
 }
 
 impl Default for StringBatchBuilder {
@@ -92,6 +93,7 @@ impl StringBatchBuilder {
             common: CommonColumnsBuilder::new(),
             value: BinaryBuilder::new(),
             len: 0,
+            data_bytes: 0,
         }
     }
 
@@ -99,6 +101,7 @@ impl StringBatchBuilder {
         if let RdbValue::String(ref v) = entry.value {
             self.common.append(entry, 1, entry.type_name());
             self.value.append_value(v);
+            self.data_bytes += entry.key.len() + v.len();
             self.len += 1;
         }
     }
@@ -107,6 +110,7 @@ impl StringBatchBuilder {
         let mut columns = self.common.finish();
         columns.push(Arc::new(self.value.finish()));
         self.len = 0;
+        self.data_bytes = 0;
         Ok(RecordBatch::try_new(Arc::new(schema::string_schema()), columns)?)
     }
 
@@ -116,6 +120,10 @@ impl StringBatchBuilder {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.data_bytes
     }
 }
 
@@ -128,6 +136,7 @@ pub(crate) struct ListBatchBuilder {
     index: UInt64Builder,
     element: BinaryBuilder,
     len: usize,
+    data_bytes: usize,
 }
 
 impl Default for ListBatchBuilder {
@@ -143,6 +152,7 @@ impl ListBatchBuilder {
             index: UInt64Builder::new(),
             element: BinaryBuilder::new(),
             len: 0,
+            data_bytes: 0,
         }
     }
 
@@ -151,7 +161,6 @@ impl ListBatchBuilder {
             let num_elements = entry.total_elements.unwrap_or(elements.len() as u64);
             let offset = entry.element_offset.unwrap_or(0);
             if elements.is_empty() {
-                // Emit one row with nulls so the key isn't dropped.
                 self.common.append(entry, 0, entry.type_name());
                 self.index.append_null();
                 self.element.append_null();
@@ -161,6 +170,7 @@ impl ListBatchBuilder {
                     self.common.append(entry, num_elements, entry.type_name());
                     self.index.append_value(offset + i as u64);
                     self.element.append_value(elem);
+                    self.data_bytes += entry.key.len() + elem.len();
                     self.len += 1;
                 }
             }
@@ -172,6 +182,7 @@ impl ListBatchBuilder {
         columns.push(Arc::new(self.index.finish()));
         columns.push(Arc::new(self.element.finish()));
         self.len = 0;
+        self.data_bytes = 0;
         Ok(RecordBatch::try_new(Arc::new(schema::list_schema()), columns)?)
     }
 
@@ -181,6 +192,10 @@ impl ListBatchBuilder {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.data_bytes
     }
 }
 
@@ -192,6 +207,7 @@ pub(crate) struct SetBatchBuilder {
     common: CommonColumnsBuilder,
     member: BinaryBuilder,
     len: usize,
+    data_bytes: usize,
 }
 
 impl Default for SetBatchBuilder {
@@ -206,6 +222,7 @@ impl SetBatchBuilder {
             common: CommonColumnsBuilder::new(),
             member: BinaryBuilder::new(),
             len: 0,
+            data_bytes: 0,
         }
     }
 
@@ -220,6 +237,7 @@ impl SetBatchBuilder {
                 for m in members {
                     self.common.append(entry, num_elements, entry.type_name());
                     self.member.append_value(m);
+                    self.data_bytes += entry.key.len() + m.len();
                     self.len += 1;
                 }
             }
@@ -230,6 +248,7 @@ impl SetBatchBuilder {
         let mut columns = self.common.finish();
         columns.push(Arc::new(self.member.finish()));
         self.len = 0;
+        self.data_bytes = 0;
         Ok(RecordBatch::try_new(Arc::new(schema::set_schema()), columns)?)
     }
 
@@ -239,6 +258,10 @@ impl SetBatchBuilder {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.data_bytes
     }
 }
 
@@ -251,6 +274,7 @@ pub(crate) struct SortedSetBatchBuilder {
     member: BinaryBuilder,
     score: Float64Builder,
     len: usize,
+    data_bytes: usize,
 }
 
 impl Default for SortedSetBatchBuilder {
@@ -266,6 +290,7 @@ impl SortedSetBatchBuilder {
             member: BinaryBuilder::new(),
             score: Float64Builder::new(),
             len: 0,
+            data_bytes: 0,
         }
     }
 
@@ -282,6 +307,7 @@ impl SortedSetBatchBuilder {
                     self.common.append(entry, num_elements, entry.type_name());
                     self.member.append_value(m);
                     self.score.append_value(*s);
+                    self.data_bytes += entry.key.len() + m.len() + 8;
                     self.len += 1;
                 }
             }
@@ -293,6 +319,7 @@ impl SortedSetBatchBuilder {
         columns.push(Arc::new(self.member.finish()));
         columns.push(Arc::new(self.score.finish()));
         self.len = 0;
+        self.data_bytes = 0;
         Ok(RecordBatch::try_new(Arc::new(schema::sorted_set_schema()), columns)?)
     }
 
@@ -302,6 +329,10 @@ impl SortedSetBatchBuilder {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.data_bytes
     }
 }
 
@@ -315,6 +346,7 @@ pub(crate) struct HashBatchBuilder {
     field_value: BinaryBuilder,
     field_expiry_ms: Int64Builder,
     len: usize,
+    data_bytes: usize,
 }
 
 impl Default for HashBatchBuilder {
@@ -331,6 +363,7 @@ impl HashBatchBuilder {
             field_value: BinaryBuilder::new(),
             field_expiry_ms: Int64Builder::new(),
             len: 0,
+            data_bytes: 0,
         }
     }
 
@@ -352,6 +385,7 @@ impl HashBatchBuilder {
                         Some(v) => self.field_expiry_ms.append_value(v),
                         None => self.field_expiry_ms.append_null(),
                     }
+                    self.data_bytes += entry.key.len() + hf.field.len() + hf.value.len();
                     self.len += 1;
                 }
             }
@@ -364,6 +398,7 @@ impl HashBatchBuilder {
         columns.push(Arc::new(self.field_value.finish()));
         columns.push(Arc::new(self.field_expiry_ms.finish()));
         self.len = 0;
+        self.data_bytes = 0;
         Ok(RecordBatch::try_new(Arc::new(schema::hash_schema()), columns)?)
     }
 
@@ -373,6 +408,10 @@ impl HashBatchBuilder {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.data_bytes
     }
 }
 
@@ -387,6 +426,7 @@ pub(crate) struct GeoBatchBuilder {
     latitude: Float64Builder,
     geohash_score: Float64Builder,
     len: usize,
+    data_bytes: usize,
 }
 
 impl Default for GeoBatchBuilder {
@@ -404,6 +444,7 @@ impl GeoBatchBuilder {
             latitude: Float64Builder::new(),
             geohash_score: Float64Builder::new(),
             len: 0,
+            data_bytes: 0,
         }
     }
 
@@ -429,6 +470,7 @@ impl GeoBatchBuilder {
                         self.latitude.append_null();
                     }
                     self.geohash_score.append_value(*s);
+                    self.data_bytes += entry.key.len() + m.len() + 24;
                     self.len += 1;
                 }
             }
@@ -442,6 +484,7 @@ impl GeoBatchBuilder {
         columns.push(Arc::new(self.latitude.finish()));
         columns.push(Arc::new(self.geohash_score.finish()));
         self.len = 0;
+        self.data_bytes = 0;
         Ok(RecordBatch::try_new(Arc::new(schema::geo_schema()), columns)?)
     }
 
@@ -451,6 +494,10 @@ impl GeoBatchBuilder {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.data_bytes
     }
 }
 
@@ -464,6 +511,7 @@ pub(crate) struct HllBatchBuilder {
     cached_cardinality: Int64Builder,
     raw_value: BinaryBuilder,
     len: usize,
+    data_bytes: usize,
 }
 
 impl Default for HllBatchBuilder {
@@ -480,6 +528,7 @@ impl HllBatchBuilder {
             cached_cardinality: Int64Builder::new(),
             raw_value: BinaryBuilder::new(),
             len: 0,
+            data_bytes: 0,
         }
     }
 
@@ -491,6 +540,7 @@ impl HllBatchBuilder {
             self.cached_cardinality
                 .append_value(detect::hll_cached_cardinality(data));
             self.raw_value.append_value(data);
+            self.data_bytes += entry.key.len() + data.len();
             self.len += 1;
         }
     }
@@ -501,6 +551,7 @@ impl HllBatchBuilder {
         columns.push(Arc::new(self.cached_cardinality.finish()));
         columns.push(Arc::new(self.raw_value.finish()));
         self.len = 0;
+        self.data_bytes = 0;
         Ok(RecordBatch::try_new(Arc::new(schema::hll_schema()), columns)?)
     }
 
@@ -510,6 +561,10 @@ impl HllBatchBuilder {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.data_bytes
     }
 }
 

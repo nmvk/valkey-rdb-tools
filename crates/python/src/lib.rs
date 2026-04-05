@@ -33,7 +33,7 @@ fn read<'py>(py: Python<'py>, path: &str, batch_size: usize, no_chunking: bool) 
         reader
     };
 
-    let batcher = ArrowBatcher::new(BatcherConfig { batch_size });
+    let batcher = ArrowBatcher::new(BatcherConfig { batch_size, ..Default::default() });
     let batch_iter = batcher.process(reader);
 
     // Collect batches per type
@@ -84,7 +84,7 @@ fn read_batches(path: &str, batch_size: usize, no_chunking: bool) -> PyResult<Ba
         reader
     };
 
-    let batcher = ArrowBatcher::new(BatcherConfig { batch_size });
+    let batcher = ArrowBatcher::new(BatcherConfig { batch_size, ..Default::default() });
     let batch_iter = batcher.process(reader);
 
     Ok(BatchReader {
@@ -191,7 +191,7 @@ fn to_parquet(
         let output_path = std::path::Path::new(&output_dir);
         std::fs::create_dir_all(output_path).map_err(ThreadError::Io)?;
 
-        let batcher = ArrowBatcher::new(BatcherConfig { batch_size });
+        let batcher = ArrowBatcher::new(BatcherConfig { batch_size, ..Default::default() });
         let batches = batcher.process(reader);
 
         let writer_factory = |tag: TypeTag| -> Result<File, ArrowConvertError> {
