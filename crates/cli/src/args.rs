@@ -45,9 +45,9 @@ pub struct ExportArgs {
     #[arg(long)]
     pub db: Option<u32>,
 
-    /// Filter by type tag (string, list, set, zset, hash, geo, hll)
+    /// Filter by type (comma-separated: string, list, set, zset, hash, geo, hll)
     #[arg(long = "type")]
-    pub type_name: Option<String>,
+    pub type_names: Option<String>,
 
     /// Filter keys by glob pattern
     #[arg(long)]
@@ -65,8 +65,7 @@ pub struct ExportArgs {
     #[arg(long)]
     pub shard_id: Option<String>,
 
-    /// Maximum elements per collection chunk to bound memory [default: 50000].
-    /// Note: disables geo-key auto-detection for chunked sorted sets.
+    /// Maximum elements per collection chunk to bound memory [default: 50000]
     #[arg(long, value_parser = parse_positive_usize)]
     pub max_key_elements: Option<usize>,
 

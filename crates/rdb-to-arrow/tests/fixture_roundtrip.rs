@@ -268,7 +268,8 @@ fn encodings_rdb_all_types_parsed() {
 
     // Verify large collections parsed fully.
     // big_hash: 200 fields, big_set: 200 members, big_zset: 200 members, big_list: 500 elements
-    // Note: small_zset (scores 1.0, 2.0, 3.0) is detected as Geo (integer scores are valid geohashes).
+    // small_zset (scores 1.0, 2.0, 3.0) has integer scores that are valid geohashes,
+    // so it appears additively in both SortedSet and Geo.
     let hash_rows = total_rows(by_type.get(&TypeTag::Hash).unwrap());
     assert!(hash_rows >= 202, "should have at least 200 (big_hash) + 2 (small_hash) = 202 hash rows, got {hash_rows}");
 
@@ -280,6 +281,9 @@ fn encodings_rdb_all_types_parsed() {
 
     let list_rows = total_rows(by_type.get(&TypeTag::List).unwrap());
     assert!(list_rows >= 505, "should have at least 500 (big_list) + 5 (small_list) = 505 list rows, got {list_rows}");
+
+    // Additive geo detection: small_zset with integer scores appears in Geo too
+    assert!(by_type.contains_key(&TypeTag::Geo), "small_zset should be additively detected as geo");
 }
 
 /// Parse encodings.rdb with chunking enabled (max_key_elements=50) and verify
@@ -291,6 +295,7 @@ fn encodings_rdb_chunked_same_row_counts() {
     let baseline_hash = total_rows(baseline.get(&TypeTag::Hash).unwrap());
     let baseline_set = total_rows(baseline.get(&TypeTag::Set).unwrap());
     let baseline_list = total_rows(baseline.get(&TypeTag::List).unwrap());
+    let baseline_zset = total_rows(baseline.get(&TypeTag::SortedSet).unwrap());
 
     // Now parse with chunking
     let f = std::fs::File::open(fixture_path("encodings.rdb")).unwrap();
@@ -310,6 +315,7 @@ fn encodings_rdb_chunked_same_row_counts() {
     let chunked_hash = total_rows(by_type.get(&TypeTag::Hash).unwrap());
     let chunked_set = total_rows(by_type.get(&TypeTag::Set).unwrap());
     let chunked_list = total_rows(by_type.get(&TypeTag::List).unwrap());
+    let chunked_zset = total_rows(by_type.get(&TypeTag::SortedSet).unwrap());
 
     assert_eq!(
         chunked_hash, baseline_hash,
@@ -322,5 +328,9 @@ fn encodings_rdb_chunked_same_row_counts() {
     assert_eq!(
         chunked_list, baseline_list,
         "chunked list rows ({chunked_list}) should match baseline ({baseline_list})"
+    );
+    assert_eq!(
+        chunked_zset, baseline_zset,
+        "chunked zset rows ({chunked_zset}) should match baseline ({baseline_zset})"
     );
 }

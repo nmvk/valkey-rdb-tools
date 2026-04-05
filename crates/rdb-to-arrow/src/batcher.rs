@@ -8,7 +8,7 @@ use crate::builders::{
     SortedSetBatchBuilder, StringBatchBuilder,
 };
 use crate::error::ArrowConvertError;
-use crate::schema::{type_tag_for, TypeTag};
+use crate::schema::{type_tag_for, is_geo_entry, TypeTag};
 
 /// Configuration for the Arrow batcher.
 #[derive(Debug, Clone)]
@@ -22,7 +22,9 @@ pub struct BatcherConfig {
 
 impl Default for BatcherConfig {
     fn default() -> Self {
-        Self { batch_size: 65_536 }
+        Self {
+            batch_size: 65_536,
+        }
     }
 }
 
@@ -65,6 +67,10 @@ impl ArrowBatcher {
 
     /// Push an entry into the appropriate builder. Returns any batches that
     /// crossed the `batch_size` threshold.
+    ///
+    /// Sorted sets are always routed to the zset builder. If the entry also
+    /// looks like geo data (all scores are valid 52-bit geohashes), it is
+    /// additively pushed to the geo builder as well.
     pub fn push(
         &mut self,
         entry: &rdb_parser::RdbEntry,
@@ -80,12 +86,21 @@ impl ArrowBatcher {
             TypeTag::Set => self.set.push(entry),
             TypeTag::SortedSet => self.zset.push(entry),
             TypeTag::Hash => self.hash.push(entry),
-            TypeTag::Geo => self.geo.push(entry),
+            TypeTag::Geo => unreachable!("type_tag_for never returns Geo"),
             TypeTag::HyperLogLog => self.hll.push(entry),
+        }
+
+        // Additive geo: also push to geo builder if it looks like geo data
+        let also_geo = tag == TypeTag::SortedSet && is_geo_entry(entry);
+        if also_geo {
+            self.geo.push(entry);
         }
 
         let mut out = Vec::new();
         self.maybe_flush_tag(tag, &mut out)?;
+        if also_geo {
+            self.maybe_flush_tag(TypeTag::Geo, &mut out)?;
+        }
         Ok(out)
     }
 
@@ -236,16 +251,20 @@ mod tests {
         test_entry_typed(key, RdbValue::List(elems), 1) // RDB_TYPE_LIST
     }
 
+    fn config(batch_size: usize) -> BatcherConfig {
+        BatcherConfig { batch_size }
+    }
+
     #[test]
     fn push_below_threshold_no_batches() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+        let mut batcher = ArrowBatcher::new(config(100));
         let batches = batcher.push(&string_entry(b"k", b"v")).unwrap();
         assert!(batches.is_empty());
     }
 
     #[test]
     fn push_crosses_threshold() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 3 });
+        let mut batcher = ArrowBatcher::new(config(3));
         for i in 0..3 {
             let key = format!("k{i}");
             let batches = batcher
@@ -263,7 +282,7 @@ mod tests {
 
     #[test]
     fn flush_returns_partial() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+        let mut batcher = ArrowBatcher::new(config(100));
         batcher.push(&string_entry(b"a", b"1")).unwrap();
         batcher.push(&string_entry(b"b", b"2")).unwrap();
         let batches = batcher.flush().unwrap();
@@ -273,7 +292,7 @@ mod tests {
 
     #[test]
     fn list_explodes_rows() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 5 });
+        let mut batcher = ArrowBatcher::new(config(5));
         // A list with 3 elements produces 3 rows.
         let batches = batcher
             .push(&list_entry(
@@ -297,7 +316,7 @@ mod tests {
             })
             .collect();
 
-        let batcher = ArrowBatcher::new(BatcherConfig { batch_size: 3 });
+        let batcher = ArrowBatcher::new(config(3));
         let batches: Vec<_> = batcher
             .process(entries.into_iter())
             .collect::<Result<Vec<_>, _>>()
@@ -311,7 +330,7 @@ mod tests {
 
     #[test]
     fn multiple_types_separate_batches() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+        let mut batcher = ArrowBatcher::new(config(100));
         batcher.push(&string_entry(b"s1", b"v1")).unwrap();
         batcher
             .push(&list_entry(b"l1", vec![b"a".to_vec()]))
@@ -338,7 +357,7 @@ mod tests {
 
     #[test]
     fn hll_routes_to_hll_builder() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+        let mut batcher = ArrowBatcher::new(config(100));
         batcher.push(&make_hll_entry(b"hll1")).unwrap();
         batcher.push(&make_hll_entry(b"hll2")).unwrap();
         let batches = batcher.flush().unwrap();
@@ -349,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn geo_routes_to_geo_builder() {
-        // Use integer scores valid as 52-bit geohashes.
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+    fn geo_additive_both_zset_and_geo() {
+        // Valid geohash scores → produces both SortedSet and Geo batches (additive).
+        let mut batcher = ArrowBatcher::new(config(100));
         batcher
             .push(&geo_entry(
                 b"places",
@@ -363,14 +382,16 @@ mod tests {
             .unwrap();
         let batches = batcher.flush().unwrap();
 
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].tag, TypeTag::Geo);
-        assert_eq!(batches[0].batch.num_rows(), 2);
+        assert_eq!(batches.len(), 2);
+        let zset_b = batches.iter().find(|b| b.tag == TypeTag::SortedSet).unwrap();
+        assert_eq!(zset_b.batch.num_rows(), 2);
+        let geo_b = batches.iter().find(|b| b.tag == TypeTag::Geo).unwrap();
+        assert_eq!(geo_b.batch.num_rows(), 2);
     }
 
     #[test]
     fn regular_string_not_hll() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+        let mut batcher = ArrowBatcher::new(config(100));
         batcher.push(&string_entry(b"s1", b"hello")).unwrap();
         let batches = batcher.flush().unwrap();
 
@@ -380,7 +401,7 @@ mod tests {
 
     #[test]
     fn regular_zset_not_geo() {
-        let mut batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+        let mut batcher = ArrowBatcher::new(config(100));
         batcher
             .push(&geo_entry(
                 b"zset",
@@ -405,14 +426,14 @@ mod tests {
             Ok(string_entry(b"s2", b"val2")),
         ];
 
-        let batcher = ArrowBatcher::new(BatcherConfig { batch_size: 100 });
+        let batcher = ArrowBatcher::new(config(100));
         let batches: Vec<_> = batcher
             .process(entries.into_iter())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        // 3 separate type batches: String(2), HyperLogLog(1), Geo(1)
-        assert_eq!(batches.len(), 3);
+        // 4 batches: String(2), HyperLogLog(1), SortedSet(1), Geo(1)
+        assert_eq!(batches.len(), 4);
         let string_b = batches.iter().find(|b| b.tag == TypeTag::String).unwrap();
         assert_eq!(string_b.batch.num_rows(), 2);
         let hll_b = batches
@@ -420,6 +441,8 @@ mod tests {
             .find(|b| b.tag == TypeTag::HyperLogLog)
             .unwrap();
         assert_eq!(hll_b.batch.num_rows(), 1);
+        let zset_b = batches.iter().find(|b| b.tag == TypeTag::SortedSet).unwrap();
+        assert_eq!(zset_b.batch.num_rows(), 1);
         let geo_b = batches.iter().find(|b| b.tag == TypeTag::Geo).unwrap();
         assert_eq!(geo_b.batch.num_rows(), 1);
     }

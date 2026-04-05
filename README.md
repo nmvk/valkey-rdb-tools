@@ -44,6 +44,9 @@ valkey-rdb export dump.rdb -f csv
 # Filter by database, type, or key pattern
 valkey-rdb export dump.rdb --db 0 --type hash --key-pattern "user:*"
 
+# Filter multiple types (comma-separated)
+valkey-rdb export dump.rdb --type hash,geo
+
 # Read from stdin
 cat dump.rdb | valkey-rdb export - -o output/
 
@@ -98,7 +101,7 @@ rdb-parser  -->  rdb-to-arrow  -->  cli / python
 ```
 
 - **[rdb-parser](crates/rdb-parser/)** — Zero-dependency RDB parser. Reads the binary format and yields `RdbEntry` items via `Iterator`.
-- **[rdb-to-arrow](crates/rdb-to-arrow/)** — Converts entries into Arrow RecordBatches. Handles virtual type detection (Geo, HyperLogLog), batching, and writing to all output formats.
+- **[rdb-to-arrow](crates/rdb-to-arrow/)** — Converts entries into Arrow RecordBatches. Handles virtual type detection (HyperLogLog exclusive from strings; Geo additive alongside sorted sets), batching, and writing to all output formats.
 - **[cli](crates/cli/)** — The `valkey-rdb` binary. Two commands: `export` and `schema`.
 - **[python](crates/python/)** — PyO3 bindings exposing `read()`, `read_batches()`, `to_parquet()`, and `inspect()`.
 
@@ -111,14 +114,14 @@ rdb-parser  -->  rdb-to-arrow  -->  cli / python
 | Set | hashtable, intset, listpack | 9 columns (one row per member) |
 | Sorted Set | v1, v2, ziplist, listpack | 10 columns (member + score) |
 | Hash | hashtable, ziplist, listpack, HASH_2 | 11 columns (field + value + per-field TTL) |
-| Geo (virtual) | Detected from sorted set geohash scores | 12 columns (member + lon/lat) |
-| HyperLogLog (virtual) | Detected from HYLL magic header | 11 columns (encoding + cardinality) |
+| Geo (virtual, always-on) | Additive: sorted sets with geohash scores appear in both zset and geo output | 12 columns (member + lon/lat) |
+| HyperLogLog (virtual, exclusive) | Detected from HYLL magic header; replaces string output | 11 columns (encoding + cardinality) |
 
 Streams and modules are skipped during parsing.
 
 ### Design choices
 
-- **Streaming** — Never loads an entire RDB into memory. A 100GB file uses the same ~30MB as a 1MB file.
+- **Streaming** — Never loads an entire RDB into memory. Large plain-encoded collections are chunked automatically (default: 50K elements) to bound peak memory.
 - **Export only** — No RDB writing. RDB is Valkey's internal format; writing it externally is fragile.
 - **Lean** — Zero cloud dependencies. No runtime config files. Bring your own upload logic.
 

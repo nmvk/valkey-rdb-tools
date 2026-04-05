@@ -1,10 +1,12 @@
-use rdb_parser::{RdbEntry, RdbValue};
-use rdb_to_arrow::TypeTag;
+use std::collections::HashSet;
 
-/// Filters RDB entries by database, type tag, and key glob pattern.
+use rdb_parser::RdbEntry;
+use rdb_to_arrow::{is_geo_entry, TypeTag};
+
+/// Filters RDB entries by database, type tags, and key glob pattern.
 pub struct EntryFilter {
     pub db: Option<u32>,
-    pub type_tag: Option<TypeTag>,
+    pub type_tags: Option<HashSet<TypeTag>>,
     pub key_pattern: Option<String>,
 }
 
@@ -16,8 +18,8 @@ impl EntryFilter {
             }
         }
 
-        if let Some(tag) = self.type_tag {
-            if !self.matches_type(entry, tag) {
+        if let Some(ref tags) = self.type_tags {
+            if !self.matches_any_type(entry, tags) {
                 return false;
             }
         }
@@ -32,26 +34,21 @@ impl EntryFilter {
         true
     }
 
-    /// Check if entry matches the target type tag. Short-circuits for non-virtual
-    /// types to avoid running geo/HLL detection on every entry.
-    fn matches_type(&self, entry: &RdbEntry, tag: TypeTag) -> bool {
-        match tag {
-            // String but not HLL — need detection
-            TypeTag::String => {
-                matches!(rdb_to_arrow::type_tag_for(entry), Some(TypeTag::String))
-            }
-            TypeTag::List => matches!(entry.value, RdbValue::List(_)),
-            TypeTag::Set => matches!(entry.value, RdbValue::Set(_)),
-            TypeTag::SortedSet => {
-                // SortedSet but not Geo — need detection
-                matches!(rdb_to_arrow::type_tag_for(entry), Some(TypeTag::SortedSet))
-            }
-            TypeTag::Hash => matches!(entry.value, RdbValue::Hash(_)),
-            // Virtual types: need full detection
-            TypeTag::Geo | TypeTag::HyperLogLog => {
-                rdb_to_arrow::type_tag_for(entry) == Some(tag)
-            }
+    /// Check if the entry will produce output for any of the requested type tags.
+    /// A sorted set with geo scores produces both SortedSet and Geo output (additive).
+    fn matches_any_type(&self, entry: &RdbEntry, tags: &HashSet<TypeTag>) -> bool {
+        let primary = match rdb_to_arrow::type_tag_for(entry) {
+            Some(t) => t,
+            None => return false,
+        };
+        if tags.contains(&primary) {
+            return true;
         }
+        // A sorted set that looks like geo also matches TypeTag::Geo
+        if primary == TypeTag::SortedSet && tags.contains(&TypeTag::Geo) && is_geo_entry(entry) {
+            return true;
+        }
+        false
     }
 }
 

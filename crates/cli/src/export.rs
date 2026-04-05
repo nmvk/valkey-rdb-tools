@@ -3,6 +3,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use rdb_parser::RdbReader;
+use std::collections::HashSet;
+
 use rdb_to_arrow::{
     metadata_from_rdb, write_arrow_ipc, write_csv, write_json, write_parquet, ArrowBatcher,
     ArrowConvertError, BatcherConfig, ParquetConfig, TypeTag,
@@ -12,13 +14,17 @@ use crate::args::{ExportArgs, FormatArg};
 use crate::filter::{EntryFilter, FilteredEntries};
 
 pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let type_tag = match &args.type_name {
-        Some(name) => Some(TypeTag::from_cli_name(name).ok_or_else(|| {
-            format!(
-                "unknown type '{}'. Valid types: string, list, set, zset, hash, geo, hll",
-                name
-            )
-        })?),
+    let type_tags: Option<HashSet<TypeTag>> = match &args.type_names {
+        Some(names) => {
+            let mut tags = HashSet::new();
+            for name in names.split(',') {
+                let name = name.trim();
+                tags.insert(TypeTag::from_cli_name(name).ok_or_else(|| {
+                    format!("unknown type '{name}'. Valid: string, list, set, zset, hash, geo, hll")
+                })?);
+            }
+            Some(tags)
+        }
         None => None,
     };
 
@@ -56,9 +62,12 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     fs::create_dir_all(&output_dir)?;
 
+    // Clone before moving into the filter — we need it again for batch-level output filtering.
+    let output_tags = type_tags.clone();
+
     let filter = EntryFilter {
         db: args.db,
-        type_tag,
+        type_tags,
         key_pattern: args.key_pattern.clone(),
     };
 
@@ -66,7 +75,19 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
     let batcher = ArrowBatcher::new(BatcherConfig {
         batch_size: args.batch_size,
     });
-    let batches = batcher.process(filtered);
+    let raw_batches = batcher.process(filtered);
+
+    // The batcher emits additive output (e.g., both zset and geo for geo-like entries).
+    // When --type is specified, only write the requested types.
+    let batches: Box<dyn Iterator<Item = Result<rdb_to_arrow::TypedBatch, ArrowConvertError>>> =
+        if let Some(tags) = output_tags {
+            Box::new(raw_batches.filter(move |result| match result {
+                Ok(tb) => tags.contains(&tb.tag),
+                Err(_) => true,
+            }))
+        } else {
+            Box::new(raw_batches)
+        };
 
     let ext = match args.format {
         FormatArg::Parquet => "parquet",

@@ -145,7 +145,11 @@ impl<R: Read> RdbReader<R> {
     /// **Note:** Chunked sorted sets skip geo-key detection (which requires
     /// seeing all scores at once), so they will always be typed as `SortedSet`
     /// rather than `Geo`.
+    /// # Panics
+    ///
+    /// Panics if `max` is 0 (would cause an infinite loop).
     pub fn with_max_key_elements(mut self, max: usize) -> Self {
+        assert!(max > 0, "max_key_elements must be > 0");
         self.max_key_elements = Some(max);
         self
     }

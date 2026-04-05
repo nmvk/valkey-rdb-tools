@@ -73,10 +73,11 @@ impl std::fmt::Display for TypeTag {
     }
 }
 
-/// Determines the TypeTag for an RDB entry. Returns None for unsupported types (stream, module).
+/// Determines the primary TypeTag for an RDB entry.
 ///
-/// Performs virtual type detection: sorted sets where all scores are valid 52-bit geohashes
-/// are tagged as `Geo`, and strings with the `HYLL` magic header are tagged as `HyperLogLog`.
+/// Returns None for unsupported types (stream, module). Strings with the `HYLL` magic header
+/// are tagged as `HyperLogLog`. Sorted sets always return `SortedSet` — geo detection is
+/// handled additively by [`is_geo_entry`].
 pub fn type_tag_for(entry: &RdbEntry) -> Option<TypeTag> {
     match &entry.value {
         RdbValue::String(data) => {
@@ -88,17 +89,18 @@ pub fn type_tag_for(entry: &RdbEntry) -> Option<TypeTag> {
         }
         RdbValue::List(_) => Some(TypeTag::List),
         RdbValue::Set(_) => Some(TypeTag::Set),
-        RdbValue::SortedSet(members) => {
-            // Skip geo detection for chunked entries — partial view may
-            // give false positives (e.g. chunk of only integer scores)
-            if entry.total_elements.is_some() || !detect::is_geo(members) {
-                Some(TypeTag::SortedSet)
-            } else {
-                Some(TypeTag::Geo)
-            }
-        }
+        RdbValue::SortedSet(_) => Some(TypeTag::SortedSet),
         RdbValue::Hash(_) => Some(TypeTag::Hash),
         _ => None,
+    }
+}
+
+/// Returns true if a sorted-set entry looks like geo data (all scores are valid 52-bit geohashes).
+/// Used by the batcher to additively emit geo output alongside the regular zset output.
+pub fn is_geo_entry(entry: &RdbEntry) -> bool {
+    match &entry.value {
+        RdbValue::SortedSet(members) => detect::is_geo(members),
+        _ => false,
     }
 }
 
@@ -328,8 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn type_tag_for_detects_geo() {
+    fn type_tag_for_sorted_set_always_returns_zset() {
         use crate::test_helpers::test_entry_typed;
+        // Even with valid geo scores, type_tag_for returns SortedSet (geo is additive)
         let entry = test_entry_typed(
             b"mygeo",
             RdbValue::SortedSet(vec![
@@ -338,7 +341,7 @@ mod tests {
             ]),
             5, // RDB_TYPE_ZSET_2
         );
-        assert_eq!(type_tag_for(&entry), Some(TypeTag::Geo));
+        assert_eq!(type_tag_for(&entry), Some(TypeTag::SortedSet));
     }
 
     #[test]
@@ -353,5 +356,37 @@ mod tests {
             5, // RDB_TYPE_ZSET_2
         );
         assert_eq!(type_tag_for(&entry), Some(TypeTag::SortedSet));
+    }
+
+    #[test]
+    fn is_geo_entry_positive() {
+        use crate::test_helpers::test_entry_typed;
+        let entry = test_entry_typed(
+            b"mygeo",
+            RdbValue::SortedSet(vec![
+                (b"Rome".to_vec(), 3479099956230698.0),
+                (b"Paris".to_vec(), 3663941556696959.0),
+            ]),
+            5, // RDB_TYPE_ZSET_2
+        );
+        assert!(is_geo_entry(&entry));
+    }
+
+    #[test]
+    fn is_geo_entry_negative() {
+        use crate::test_helpers::{test_entry, test_entry_typed};
+        // Fractional scores are not valid geohashes
+        let entry = test_entry_typed(
+            b"myzset",
+            RdbValue::SortedSet(vec![
+                (b"alice".to_vec(), 1.5),
+                (b"bob".to_vec(), 2.7),
+            ]),
+            5, // RDB_TYPE_ZSET_2
+        );
+        assert!(!is_geo_entry(&entry));
+        // Non-sorted-set entry
+        let str_entry = test_entry(b"s", RdbValue::String(b"hello".to_vec()));
+        assert!(!is_geo_entry(&str_entry));
     }
 }
