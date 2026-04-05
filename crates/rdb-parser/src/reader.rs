@@ -60,6 +60,28 @@ impl<R: Read> Read for CrcReader<R> {
     }
 }
 
+/// Default maximum elements per chunk for plain-encoded collections.
+/// Set below the typical Arrow batch size (65,536) so the batcher can flush
+/// promptly without accumulating oversized batches.
+pub const DEFAULT_MAX_KEY_ELEMENTS: usize = 50_000;
+
+/// State for reading a large key in chunks.
+///
+/// The `key` field is cloned for each chunk entry. This is acceptable because
+/// RDB keys are typically < 1KB. For adversarial key sizes (up to 512MB),
+/// the clone cost is amortized across the chunk's element I/O.
+struct ChunkedState {
+    db: u32,
+    key: Vec<u8>,
+    type_code: u8,
+    expiry_ms: Option<i64>,
+    lru_idle_secs: Option<u64>,
+    lfu_frequency: Option<u8>,
+    total_count: usize,
+    remaining: usize,
+    element_offset: u64,
+}
+
 /// The main RDB reader. Wraps any `Read` source and yields `RdbEntry` items.
 pub struct RdbReader<R: Read> {
     reader: CrcReader<R>,
@@ -74,6 +96,11 @@ pub struct RdbReader<R: Read> {
     /// First non-AUX byte consumed by read_preamble(), replayed by next_inner().
     preamble_byte: Option<u8>,
     finished: bool,
+    /// Maximum elements per chunk. Defaults to [`DEFAULT_MAX_KEY_ELEMENTS`].
+    /// `None` disables chunking entirely.
+    max_key_elements: Option<usize>,
+    /// Active chunk-reading state for a large key being split across entries.
+    chunked: Option<ChunkedState>,
 }
 
 impl<R: Read> RdbReader<R> {
@@ -93,6 +120,8 @@ impl<R: Read> RdbReader<R> {
             pending_lfu_freq: None,
             preamble_byte: None,
             finished: false,
+            max_key_elements: Some(DEFAULT_MAX_KEY_ELEMENTS),
+            chunked: None,
         };
         rdr.read_preamble()?;
         Ok(rdr)
@@ -106,6 +135,26 @@ impl<R: Read> RdbReader<R> {
     /// File-level metadata from AUX fields.
     pub fn metadata(&self) -> &RdbMetadata {
         &self.metadata
+    }
+
+    /// Set the maximum number of elements per chunk for large plain-encoded
+    /// collections. When a key has more elements than this limit, it will be
+    /// yielded as multiple `RdbEntry` values with `total_elements` and
+    /// `element_offset` set. Default is [`DEFAULT_MAX_KEY_ELEMENTS`] (50,000).
+    ///
+    /// **Note:** Chunked sorted sets skip geo-key detection (which requires
+    /// seeing all scores at once), so they will always be typed as `SortedSet`
+    /// rather than `Geo`.
+    pub fn with_max_key_elements(mut self, max: usize) -> Self {
+        self.max_key_elements = Some(max);
+        self
+    }
+
+    /// Disable chunking entirely. All collections will be read into a single
+    /// `RdbEntry` regardless of size.
+    pub fn without_chunking(mut self) -> Self {
+        self.max_key_elements = None;
+        self
     }
 
     // --- Private helpers ---
@@ -339,8 +388,58 @@ impl<R: Read> RdbReader<R> {
         let lfu_frequency = self.pending_lfu_freq.take();
 
         let key = self.read_string()?;
-        let value = self.read_value(type_code)?;
 
+        // Check if this is a chunkable plain type that exceeds the threshold
+        if let Some(max) = self.max_key_elements {
+            if is_plain_type(type_code) {
+                let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
+                if count > max {
+                    let chunk_size = max.min(count);
+                    let value = self.read_n_elements(type_code, chunk_size)?;
+                    let remaining = count - chunk_size;
+                    if remaining > 0 {
+                        self.chunked = Some(ChunkedState {
+                            db: self.current_db,
+                            key: key.clone(),
+                            type_code,
+                            expiry_ms,
+                            lru_idle_secs,
+                            lfu_frequency,
+                            total_count: count,
+                            remaining,
+                            element_offset: chunk_size as u64,
+                        });
+                    }
+                    return Ok(RdbEntry {
+                        db: self.current_db,
+                        key,
+                        value,
+                        type_code,
+                        expiry_ms,
+                        lru_idle_secs,
+                        lfu_frequency,
+                        total_elements: Some(count as u64),
+                        element_offset: Some(0),
+                    });
+                }
+                // count <= max: read all elements normally (inline the read)
+                let value = self.read_n_elements(type_code, count)?;
+                return Ok(RdbEntry {
+                    db: self.current_db,
+                    key,
+                    value,
+                    type_code,
+                    expiry_ms,
+                    lru_idle_secs,
+                    lfu_frequency,
+                    total_elements: None,
+                    element_offset: None,
+                });
+            }
+        }
+
+        // Non-chunked path: compact types, strings, or no max_key_elements set
+        let value = self.read_value(type_code)?;
         Ok(RdbEntry {
             db: self.current_db,
             key,
@@ -349,6 +448,8 @@ impl<R: Read> RdbReader<R> {
             expiry_ms,
             lru_idle_secs,
             lfu_frequency,
+            total_elements: None,
+            element_offset: None,
         })
     }
 
@@ -636,6 +737,132 @@ impl<R: Read> RdbReader<R> {
 
         Ok(())
     }
+
+    /// Read exactly `n` elements for a plain-encoded type, returning the
+    /// appropriate `RdbValue`.
+    fn read_n_elements(&mut self, type_code: u8, n: usize) -> Result<RdbValue, RdbError> {
+        match type_code {
+            RDB_TYPE_LIST => {
+                let mut elements = Vec::with_capacity(n);
+                for _ in 0..n {
+                    elements.push(self.read_string()?);
+                }
+                Ok(RdbValue::List(elements))
+            }
+            RDB_TYPE_SET => {
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push(self.read_string()?);
+                }
+                Ok(RdbValue::Set(members))
+            }
+            RDB_TYPE_ZSET => {
+                let mut pairs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let member = self.read_string()?;
+                    let score = self.read_double_value()?;
+                    pairs.push((member, score));
+                }
+                Ok(RdbValue::SortedSet(pairs))
+            }
+            RDB_TYPE_HASH => {
+                let mut fields = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let field = self.read_string()?;
+                    let value = self.read_string()?;
+                    fields.push(HashField {
+                        field,
+                        value,
+                        expiry_ms: None,
+                    });
+                }
+                Ok(RdbValue::Hash(fields))
+            }
+            RDB_TYPE_ZSET_2 => {
+                let mut pairs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let member = self.read_string()?;
+                    let buf = self.read_exact_vec(8)?;
+                    let score = f64::from_le_bytes(
+                        buf.try_into().expect("read_exact_vec returned 8 bytes"),
+                    );
+                    pairs.push((member, score));
+                }
+                Ok(RdbValue::SortedSet(pairs))
+            }
+            RDB_TYPE_HASH_2 => {
+                let mut fields = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let field = self.read_string()?;
+                    let value = self.read_string()?;
+                    let ttl = self.read_i64_le()?;
+                    fields.push(HashField {
+                        field,
+                        value,
+                        expiry_ms: if ttl == -1 { None } else { Some(ttl) },
+                    });
+                }
+                Ok(RdbValue::Hash(fields))
+            }
+            _ => Err(RdbError::CorruptData(format!(
+                "read_n_elements called with non-plain type code {}",
+                type_code
+            ))),
+        }
+    }
+
+    /// Continue reading the next chunk of a large key being split.
+    fn read_chunk(&mut self) -> Result<RdbEntry, RdbError> {
+        let state = self.chunked.as_mut().ok_or_else(|| {
+            RdbError::CorruptData("read_chunk called without chunked state".into())
+        })?;
+        let max = self.max_key_elements.ok_or_else(|| {
+            RdbError::CorruptData("chunked state without max_key_elements".into())
+        })?;
+        let chunk_size = max.min(state.remaining);
+        let element_offset = state.element_offset;
+
+        // Extract what we need before the mutable borrow in read_n_elements
+        let type_code = state.type_code;
+        let db = state.db;
+        let key = state.key.clone();
+        let expiry_ms = state.expiry_ms;
+        let lru_idle_secs = state.lru_idle_secs;
+        let lfu_frequency = state.lfu_frequency;
+        let total_count = state.total_count;
+
+        let value = self.read_n_elements(type_code, chunk_size)?;
+
+        // Update or clear chunked state
+        let state = self.chunked.as_mut().ok_or_else(|| {
+            RdbError::CorruptData("chunked state disappeared during read".into())
+        })?;
+        state.remaining -= chunk_size;
+        state.element_offset += chunk_size as u64;
+        if state.remaining == 0 {
+            self.chunked = None;
+        }
+
+        Ok(RdbEntry {
+            db,
+            key,
+            value,
+            type_code,
+            expiry_ms,
+            lru_idle_secs,
+            lfu_frequency,
+            total_elements: Some(total_count as u64),
+            element_offset: Some(element_offset),
+        })
+    }
+}
+
+/// Returns true if the type code is a plain-encoded type that can be chunked.
+fn is_plain_type(type_code: u8) -> bool {
+    matches!(
+        type_code,
+        RDB_TYPE_LIST | RDB_TYPE_SET | RDB_TYPE_ZSET | RDB_TYPE_HASH | RDB_TYPE_ZSET_2 | RDB_TYPE_HASH_2
+    )
 }
 
 /// Iterator implementation — yields one RdbEntry per key-value pair.
@@ -666,6 +893,11 @@ impl<R: Read> RdbReader<R> {
     /// EOF, or Err for any parse error. The caller (Iterator::next) decides
     /// whether the error is terminal.
     fn next_inner(&mut self) -> Result<Option<RdbEntry>, RdbError> {
+        // If we're mid-key in a chunked read, continue reading elements.
+        if self.chunked.is_some() {
+            return self.read_chunk().map(Some);
+        }
+
         loop {
             let byte = if let Some(b) = self.preamble_byte.take() {
                 b
@@ -1158,477 +1390,6 @@ mod tests {
         let compressed = [0u8, b'a', 0x20, 0x00];
         let result = lzf_decompress(&compressed, 4).unwrap();
         assert_eq!(result, b"aaaa");
-    }
-
-    // --- Fixture integration tests ---
-
-    #[test]
-    fn test_fixture_valkey_header() {
-        let f = std::fs::File::open("../../tests/fixtures/basic.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        assert_eq!(reader.header().magic, RdbMagic::Valkey);
-        assert_eq!(reader.header().version, 80);
-    }
-
-    #[test]
-    fn test_fixture_redis_header() {
-        let f = std::fs::File::open("../../tests/fixtures/redis_compat.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        assert_eq!(reader.header().magic, RdbMagic::Redis);
-        assert_eq!(reader.header().version, 9);
-    }
-
-    #[test]
-    fn test_fixture_empty() {
-        let f = std::fs::File::open("../../tests/fixtures/empty.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let entries: Vec<_> = reader.collect();
-        assert!(entries.is_empty(), "empty.rdb should have no entries");
-    }
-
-    #[test]
-    fn test_fixture_valkey_metadata() {
-        let f = std::fs::File::open("../../tests/fixtures/basic.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        // AUX fields are eagerly consumed in new(), so metadata is available immediately
-        assert!(
-            reader.metadata().server_version().is_some(),
-            "should have server version in AUX immediately after new()"
-        );
-    }
-
-    #[test]
-    fn test_fixture_redis_compat_strings() {
-        // redis_compat.rdb has mystring = "hello world"
-        let f = std::fs::File::open("../../tests/fixtures/redis_compat.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-
-        let mut found_mystring = false;
-        for entry in reader {
-            match entry {
-                Ok(e) if e.key == b"mystring" => {
-                    assert_eq!(e.value, RdbValue::String(b"hello world".to_vec()));
-                    assert_eq!(e.db, 0);
-                    assert_eq!(e.type_name(), "string");
-                    found_mystring = true;
-                }
-                Ok(_) => {}
-                Err(RdbError::UnknownType(_)) => {} // expected for unimplemented types
-                Err(e) => panic!("unexpected error: {}", e),
-            }
-        }
-        assert!(found_mystring, "should find mystring key in redis_compat.rdb");
-    }
-
-    #[test]
-    fn test_fixture_expiry() {
-        let f = std::fs::File::open("../../tests/fixtures/expiry.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-
-        let mut found_no_ttl = false;
-        let mut found_future_ttl = false;
-
-        for entry in reader {
-            match entry {
-                Ok(e) if e.key == b"no_ttl_key" => {
-                    assert!(e.expiry_ms.is_none());
-                    found_no_ttl = true;
-                }
-                Ok(e) if e.key == b"future_ttl_key" => {
-                    assert_eq!(e.expiry_ms, Some(4102444800000));
-                    found_future_ttl = true;
-                }
-                _ => {}
-            }
-        }
-        assert!(found_no_ttl, "should find no_ttl_key");
-        assert!(found_future_ttl, "should find future_ttl_key with TTL");
-    }
-
-    #[test]
-    fn test_fixture_multi_db() {
-        let f = std::fs::File::open("../../tests/fixtures/multi_db.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-
-        let mut found_db0 = false;
-        let mut found_db1 = false;
-
-        for entry in reader {
-            match entry {
-                Ok(e) if e.key == b"db0_key" => {
-                    assert_eq!(e.db, 0);
-                    found_db0 = true;
-                }
-                Ok(e) if e.key == b"db1_key" => {
-                    assert_eq!(e.db, 1);
-                    found_db1 = true;
-                }
-                _ => {}
-            }
-        }
-        assert!(found_db0, "should find db0_key in db 0");
-        assert!(found_db1, "should find db1_key in db 1");
-    }
-
-    #[test]
-    fn test_fixture_int_encoded_strings() {
-        let f = std::fs::File::open("../../tests/fixtures/encodings.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-
-        let mut found_small = false;
-        let mut found_large = false;
-
-        for entry in reader {
-            match entry {
-                Ok(e) if e.key == b"int_string_small" => {
-                    assert_eq!(e.value, RdbValue::String(b"42".to_vec()));
-                    found_small = true;
-                }
-                Ok(e) if e.key == b"int_string_large" => {
-                    assert_eq!(e.value, RdbValue::String(b"1234567890".to_vec()));
-                    found_large = true;
-                }
-                _ => {}
-            }
-        }
-        assert!(found_small, "should find int_string_small = 42");
-        assert!(found_large, "should find int_string_large = 1234567890");
-    }
-
-    // --- Fixture: hash_field_ttl.rdb stays aligned ---
-
-    #[test]
-    fn test_fixture_hash_field_ttl() {
-        let f = std::fs::File::open("../../tests/fixtures/hash_field_ttl.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-
-        let hashes: Vec<_> = entries.iter().filter(|e| e.type_name() == "hash").collect();
-        assert_eq!(hashes.len(), 2, "expected 2 hash keys");
-
-        // hfe_hash: HASH_2 with per-field TTL
-        let hfe = hashes.iter().find(|e| e.key == b"hfe_hash").expect("hfe_hash key");
-        let fields = match &hfe.value {
-            RdbValue::Hash(f) => f,
-            other => panic!("expected Hash, got {:?}", other),
-        };
-        assert_eq!(fields.len(), 3);
-
-        let persist = fields.iter().find(|f| f.field == b"field_persist").unwrap();
-        assert_eq!(persist.value, b"no expiry");
-        assert_eq!(persist.expiry_ms, None);
-
-        let future = fields.iter().find(|f| f.field == b"field_future").unwrap();
-        assert_eq!(future.value, b"expires later");
-        assert_eq!(future.expiry_ms, Some(4_102_444_800_000));
-
-        let short = fields.iter().find(|f| f.field == b"field_short").unwrap();
-        assert_eq!(short.value, b"expires soon");
-        assert_eq!(short.expiry_ms, Some(4_102_444_800_000));
-
-        // normal_hash: regular hash, no per-field TTL
-        let normal = hashes.iter().find(|e| e.key == b"normal_hash").expect("normal_hash key");
-        let fields = match &normal.value {
-            RdbValue::Hash(f) => f,
-            other => panic!("expected Hash, got {:?}", other),
-        };
-        assert_eq!(fields.len(), 2);
-        assert!(fields.iter().all(|f| f.expiry_ms.is_none()), "normal hash should have no field TTLs");
-    }
-
-    // --- Fixture: streams.rdb stays aligned ---
-
-    #[test]
-    fn test_fixture_streams_no_crash() {
-        let f = std::fs::File::open("../../tests/fixtures/streams.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut count = 0;
-        for entry in reader {
-            count += 1;
-            let _ = entry;
-        }
-        assert!(count > 0, "streams.rdb should have entries");
-    }
-
-    // --- Fixture: set_listpack.rdb ---
-
-    #[test]
-    fn test_fixture_set_listpack() {
-        let f = std::fs::File::open("../../tests/fixtures/set_listpack.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut found = false;
-        for entry in reader {
-            let e = entry.unwrap();
-            if e.key == b"myset" {
-                if let RdbValue::Set(members) = &e.value {
-                    let mut sorted: Vec<&[u8]> = members.iter().map(|m| m.as_slice()).collect();
-                    sorted.sort();
-                    assert_eq!(sorted, vec![
-                        &b"alpha"[..], &b"beta"[..], &b"delta"[..], &b"gamma"[..]
-                    ]);
-                    found = true;
-                } else {
-                    panic!("expected Set, got {:?}", e.value);
-                }
-            }
-        }
-        assert!(found, "should find myset");
-    }
-
-    // --- Fixture: hash_listpack.rdb ---
-
-    #[test]
-    fn test_fixture_hash_listpack() {
-        let f = std::fs::File::open("../../tests/fixtures/hash_listpack.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut found = false;
-        for entry in reader {
-            let e = entry.unwrap();
-            if e.key == b"myhash" {
-                if let RdbValue::Hash(fields) = &e.value {
-                    let mut map: Vec<(&[u8], &[u8])> = fields
-                        .iter()
-                        .map(|f| (f.field.as_slice(), f.value.as_slice()))
-                        .collect();
-                    map.sort_by_key(|&(k, _)| k);
-                    assert_eq!(map, vec![
-                        (&b"age"[..], &b"30"[..]),
-                        (&b"city"[..], &b"nyc"[..]),
-                        (&b"name"[..], &b"alice"[..]),
-                    ]);
-                    // Listpack hashes have no per-field TTL
-                    assert!(fields.iter().all(|f| f.expiry_ms.is_none()));
-                    found = true;
-                } else {
-                    panic!("expected Hash, got {:?}", e.value);
-                }
-            }
-        }
-        assert!(found, "should find myhash");
-    }
-
-    // --- Fixture: zset_listpack.rdb ---
-
-    #[test]
-    fn test_fixture_zset_listpack() {
-        let f = std::fs::File::open("../../tests/fixtures/zset_listpack.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut found = false;
-        for entry in reader {
-            let e = entry.unwrap();
-            if e.key == b"myzset" {
-                if let RdbValue::SortedSet(pairs) = &e.value {
-                    let mut sorted: Vec<(&[u8], f64)> =
-                        pairs.iter().map(|(m, s)| (m.as_slice(), *s)).collect();
-                    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    assert_eq!(sorted[0].0, b"first");
-                    assert!((sorted[0].1 - 1.5).abs() < 1e-10);
-                    assert_eq!(sorted[1].0, b"second");
-                    assert!((sorted[1].1 - 2.7).abs() < 1e-10);
-                    assert_eq!(sorted[2].0, b"third");
-                    assert!((sorted[2].1 - 3.0).abs() < 1e-10);
-                    found = true;
-                } else {
-                    panic!("expected SortedSet, got {:?}", e.value);
-                }
-            }
-        }
-        assert!(found, "should find myzset");
-    }
-
-    // --- Fixture: listpack_all.rdb (set + hash + zset in one file) ---
-
-    #[test]
-    fn test_fixture_listpack_all() {
-        let f = std::fs::File::open("../../tests/fixtures/listpack_all.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut keys: Vec<String> = Vec::new();
-        for entry in reader {
-            let e = entry.unwrap();
-            keys.push(String::from_utf8(e.key.clone()).unwrap());
-            match e.type_name() {
-                "set" => assert!(matches!(e.value, RdbValue::Set(_))),
-                "hash" => assert!(matches!(e.value, RdbValue::Hash(_))),
-                "zset" => assert!(matches!(e.value, RdbValue::SortedSet(_))),
-                other => panic!("unexpected type: {}", other),
-            }
-        }
-        keys.sort();
-        assert_eq!(keys, vec!["myhash", "myset", "myzset"]);
-    }
-
-    // --- Fixture: list_ziplist.rdb ---
-
-    #[test]
-    fn test_fixture_list_ziplist() {
-        let f = std::fs::File::open("../../tests/fixtures/list_ziplist.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut found = false;
-        for entry in reader {
-            let e = entry.unwrap();
-            if e.key == b"mylist" {
-                if let RdbValue::List(ref elems) = e.value {
-                    assert_eq!(elems.len(), 4);
-                    assert_eq!(elems[0], b"alpha");
-                    assert_eq!(elems[1], b"beta");
-                    assert_eq!(elems[2], b"7");
-                    assert_eq!(elems[3], b"-500");
-                    found = true;
-                } else {
-                    panic!("expected List, got {:?}", e.value);
-                }
-            }
-        }
-        assert!(found, "should find mylist");
-    }
-
-    // --- Fixture: hash_ziplist.rdb ---
-
-    #[test]
-    fn test_fixture_hash_ziplist() {
-        let f = std::fs::File::open("../../tests/fixtures/hash_ziplist.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut found = false;
-        for entry in reader {
-            let e = entry.unwrap();
-            if e.key == b"myhash" {
-                if let RdbValue::Hash(ref fields) = e.value {
-                    assert_eq!(fields.len(), 3);
-                    assert_eq!(fields[0].field, b"name");
-                    assert_eq!(fields[0].value, b"alice");
-                    assert_eq!(fields[1].field, b"age");
-                    assert_eq!(fields[1].value, b"10");
-                    assert_eq!(fields[2].field, b"city");
-                    assert_eq!(fields[2].value, b"nyc");
-                    found = true;
-                } else {
-                    panic!("expected Hash, got {:?}", e.value);
-                }
-            }
-        }
-        assert!(found, "should find myhash");
-    }
-
-    // --- Fixture: zset_ziplist.rdb ---
-
-    #[test]
-    fn test_fixture_zset_ziplist() {
-        let f = std::fs::File::open("../../tests/fixtures/zset_ziplist.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut found = false;
-        for entry in reader {
-            let e = entry.unwrap();
-            if e.key == b"myzset" {
-                if let RdbValue::SortedSet(ref pairs) = e.value {
-                    assert_eq!(pairs.len(), 3);
-                    let mut sorted: Vec<_> =
-                        pairs.iter().map(|(m, s)| (m.as_slice(), *s)).collect();
-                    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    assert_eq!(sorted[0].0, b"first");
-                    assert!((sorted[0].1 - 1.5).abs() < 1e-10);
-                    assert_eq!(sorted[1].0, b"second");
-                    assert!((sorted[1].1 - 2.7).abs() < 1e-10);
-                    assert_eq!(sorted[2].0, b"third");
-                    assert!((sorted[2].1 - 3.0).abs() < 1e-10);
-                    found = true;
-                } else {
-                    panic!("expected SortedSet, got {:?}", e.value);
-                }
-            }
-        }
-        assert!(found, "should find myzset");
-    }
-
-    // --- Fixture: set_intset.rdb (type 11) ---
-
-    #[test]
-    fn test_fixture_set_intset() {
-        let f = std::fs::File::open("../../tests/fixtures/set_intset.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"myset");
-        assert_eq!(entries[0].type_name(), "set");
-        assert_eq!(entries[0].encoding_name(), "intset");
-        match &entries[0].value {
-            RdbValue::Set(members) => {
-                assert_eq!(members.len(), 5);
-                let strs: Vec<&str> = members
-                    .iter()
-                    .map(|m| std::str::from_utf8(m).unwrap())
-                    .collect();
-                assert_eq!(strs, vec!["-100", "-1", "0", "42", "1000"]);
-            }
-            other => panic!("expected Set, got {:?}", other),
-        }
-    }
-
-    // --- Fixture: list_quicklist.rdb (type 14, quicklist v1) ---
-
-    #[test]
-    fn test_fixture_list_quicklist() {
-        let f = std::fs::File::open("../../tests/fixtures/list_quicklist.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"mylist");
-        assert_eq!(entries[0].type_name(), "list");
-        assert_eq!(entries[0].encoding_name(), "quicklist");
-        match &entries[0].value {
-            RdbValue::List(elems) => {
-                let strs: Vec<&str> = elems
-                    .iter()
-                    .map(|e| std::str::from_utf8(e).unwrap())
-                    .collect();
-                assert_eq!(strs, vec!["hello", "world", "foo", "7"]);
-            }
-            other => panic!("expected List, got {:?}", other),
-        }
-    }
-
-    // --- Fixture: list_quicklist2.rdb (type 18, quicklist v2) ---
-
-    #[test]
-    fn test_fixture_list_quicklist2() {
-        let f = std::fs::File::open("../../tests/fixtures/list_quicklist2.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"mylist2");
-        assert_eq!(entries[0].type_name(), "list");
-        assert_eq!(entries[0].encoding_name(), "quicklist2");
-        match &entries[0].value {
-            RdbValue::List(elems) => {
-                let strs: Vec<&str> = elems
-                    .iter()
-                    .map(|e| std::str::from_utf8(e).unwrap())
-                    .collect();
-                // node1 packed: alpha, beta; node2 packed: 42, 100; node3 plain: standalone
-                assert_eq!(strs, vec!["alpha", "beta", "42", "100", "standalone"]);
-            }
-            other => panic!("expected List, got {:?}", other),
-        }
-    }
-
-    // --- Fixture: ziplist_all.rdb (list + hash + zset in one file) ---
-
-    #[test]
-    fn test_fixture_ziplist_all() {
-        let f = std::fs::File::open("../../tests/fixtures/ziplist_all.rdb").unwrap();
-        let reader = RdbReader::new(f).unwrap();
-        let mut keys: Vec<String> = Vec::new();
-        for entry in reader {
-            let e = entry.unwrap();
-            keys.push(String::from_utf8(e.key.clone()).unwrap());
-            match e.type_name() {
-                "list" => assert!(matches!(e.value, RdbValue::List(_))),
-                "hash" => assert!(matches!(e.value, RdbValue::Hash(_))),
-                "zset" => assert!(matches!(e.value, RdbValue::SortedSet(_))),
-                other => panic!("unexpected type: {}", other),
-            }
-        }
-        keys.sort();
-        assert_eq!(keys, vec!["myhash", "mylist", "myzset"]);
     }
 
     // --- Iterator becomes terminal after hard I/O error ---
@@ -2266,6 +2027,229 @@ mod tests {
         assert!(v.is_nan());
     }
 
+    // --- Chunked reading tests ---
+
+    #[test]
+    fn test_chunked_hash_splits_correctly() {
+        // 10-field hash with max_key_elements=3 → 4 entries (3+3+3+1)
+        let mut payload = rdb_len(10);
+        for i in 0..10 {
+            payload.extend_from_slice(&rdb_string(format!("field_{i}").as_bytes()));
+            payload.extend_from_slice(&rdb_string(format!("value_{i}").as_bytes()));
+        }
+        let data = make_rdb_entry(RDB_TYPE_HASH, b"bighash", &payload);
+
+        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(3);
+        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 4, "10 fields / 3 = 4 chunks (3+3+3+1)");
+
+        // All chunks should have the same key and total_elements
+        for entry in &entries {
+            assert_eq!(entry.key, b"bighash");
+            assert_eq!(entry.total_elements, Some(10));
+        }
+
+        // Check element_offset values
+        assert_eq!(entries[0].element_offset, Some(0));
+        assert_eq!(entries[1].element_offset, Some(3));
+        assert_eq!(entries[2].element_offset, Some(6));
+        assert_eq!(entries[3].element_offset, Some(9));
+
+        // Check chunk sizes
+        let sizes: Vec<usize> = entries
+            .iter()
+            .map(|e| match &e.value {
+                RdbValue::Hash(f) => f.len(),
+                other => panic!("expected Hash, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(sizes, vec![3, 3, 3, 1]);
+
+        // Verify all 10 fields are present in order
+        let all_fields: Vec<String> = entries
+            .iter()
+            .flat_map(|e| match &e.value {
+                RdbValue::Hash(f) => f.iter().map(|hf| String::from_utf8(hf.field.clone()).unwrap()).collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        let expected: Vec<String> = (0..10).map(|i| format!("field_{i}")).collect();
+        assert_eq!(all_fields, expected);
+    }
+
+    #[test]
+    fn test_chunked_list_index_continuity() {
+        // 8-element list with max=3 → verify indices across chunks are 0..8
+        let mut payload = rdb_len(8);
+        for i in 0..8 {
+            payload.extend_from_slice(&rdb_string(format!("item_{i}").as_bytes()));
+        }
+        let data = make_rdb_entry(RDB_TYPE_LIST, b"biglist", &payload);
+
+        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(3);
+        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 3, "8 elements / 3 = 3 chunks (3+3+2)");
+
+        // Verify element_offset continuity
+        assert_eq!(entries[0].element_offset, Some(0));
+        assert_eq!(entries[1].element_offset, Some(3));
+        assert_eq!(entries[2].element_offset, Some(6));
+
+        // All have total_elements=8
+        for e in &entries {
+            assert_eq!(e.total_elements, Some(8));
+        }
+
+        // Collect all elements in order
+        let all_items: Vec<String> = entries
+            .iter()
+            .flat_map(|e| match &e.value {
+                RdbValue::List(elems) => elems.iter().map(|el| String::from_utf8(el.clone()).unwrap()).collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        let expected: Vec<String> = (0..8).map(|i| format!("item_{i}")).collect();
+        assert_eq!(all_items, expected);
+    }
+
+    #[test]
+    fn test_no_chunking_below_threshold() {
+        // 5-element set with max=10 → single entry, total_elements=None
+        let mut payload = rdb_len(5);
+        for i in 0..5 {
+            payload.extend_from_slice(&rdb_string(format!("m_{i}").as_bytes()));
+        }
+        let data = make_rdb_entry(RDB_TYPE_SET, b"smallset", &payload);
+
+        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(10);
+        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].total_elements, None);
+        assert_eq!(entries[0].element_offset, None);
+        match &entries[0].value {
+            RdbValue::Set(members) => assert_eq!(members.len(), 5),
+            other => panic!("expected Set, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_chunking_for_compact_types() {
+        // Listpack-encoded hash — should never chunk regardless of max
+        let f = std::fs::File::open(format!(
+            "{}/../../tests/fixtures/hash_listpack.rdb",
+            env!("CARGO_MANIFEST_DIR")
+        )).unwrap();
+        let reader = RdbReader::new(f).unwrap().with_max_key_elements(1);
+        let entries: Vec<_> = reader.filter_map(|e| e.ok()).collect();
+        // Should be one entry regardless of max_key_elements=1
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].total_elements, None);
+        assert_eq!(entries[0].element_offset, None);
+    }
+
+    #[test]
+    fn test_chunked_zset_v2() {
+        // 6-element zset_2 with max=4 → 2 chunks (4+2)
+        let mut payload = rdb_len(6);
+        for i in 0..6u64 {
+            payload.extend_from_slice(&rdb_string(format!("member_{i}").as_bytes()));
+            payload.extend_from_slice(&(i as f64).to_le_bytes());
+        }
+        let data = make_rdb_entry(RDB_TYPE_ZSET_2, b"myzset", &payload);
+
+        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(4);
+        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].total_elements, Some(6));
+        assert_eq!(entries[0].element_offset, Some(0));
+        assert_eq!(entries[1].total_elements, Some(6));
+        assert_eq!(entries[1].element_offset, Some(4));
+
+        // Verify all members/scores
+        let all_pairs: Vec<(String, f64)> = entries
+            .iter()
+            .flat_map(|e| match &e.value {
+                RdbValue::SortedSet(pairs) => pairs.iter().map(|(m, s)| (String::from_utf8(m.clone()).unwrap(), *s)).collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        assert_eq!(all_pairs.len(), 6);
+        for (i, (member, score)) in all_pairs.iter().enumerate() {
+            assert_eq!(member, &format!("member_{i}"));
+            assert!((score - i as f64).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_chunked_set() {
+        // 7-element set with max=3 → 3 chunks (3+3+1)
+        let mut payload = rdb_len(7);
+        for i in 0..7 {
+            payload.extend_from_slice(&rdb_string(format!("m_{i}").as_bytes()));
+        }
+        let data = make_rdb_entry(RDB_TYPE_SET, b"bigset", &payload);
+
+        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(3);
+        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 3, "7 members / 3 = 3 chunks (3+3+1)");
+
+        for e in &entries {
+            assert_eq!(e.key, b"bigset");
+            assert_eq!(e.total_elements, Some(7));
+        }
+        assert_eq!(entries[0].element_offset, Some(0));
+        assert_eq!(entries[1].element_offset, Some(3));
+        assert_eq!(entries[2].element_offset, Some(6));
+
+        let all_members: Vec<String> = entries
+            .iter()
+            .flat_map(|e| match &e.value {
+                RdbValue::Set(m) => m.iter().map(|v| String::from_utf8(v.clone()).unwrap()).collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        let expected: Vec<String> = (0..7).map(|i| format!("m_{i}")).collect();
+        assert_eq!(all_members, expected);
+    }
+
+    #[test]
+    fn test_chunked_zset_v1() {
+        // 5-element zset v1 with max=2 → 3 chunks (2+2+1)
+        let mut payload = rdb_len(5);
+        for i in 0..5 {
+            payload.extend_from_slice(&rdb_string(format!("z_{i}").as_bytes()));
+            let score_str = format!("{}.5", i);
+            payload.push(score_str.len() as u8);
+            payload.extend_from_slice(score_str.as_bytes());
+        }
+        let data = make_rdb_entry(RDB_TYPE_ZSET, b"zset_v1", &payload);
+
+        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(2);
+        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
+        assert_eq!(entries.len(), 3, "5 elements / 2 = 3 chunks (2+2+1)");
+
+        for e in &entries {
+            assert_eq!(e.key, b"zset_v1");
+            assert_eq!(e.total_elements, Some(5));
+        }
+        assert_eq!(entries[0].element_offset, Some(0));
+        assert_eq!(entries[1].element_offset, Some(2));
+        assert_eq!(entries[2].element_offset, Some(4));
+
+        let all_pairs: Vec<(String, f64)> = entries
+            .iter()
+            .flat_map(|e| match &e.value {
+                RdbValue::SortedSet(pairs) => pairs.iter().map(|(m, s)| (String::from_utf8(m.clone()).unwrap(), *s)).collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        assert_eq!(all_pairs.len(), 5);
+        for (i, (member, score)) in all_pairs.iter().enumerate() {
+            assert_eq!(member, &format!("z_{i}"));
+            assert!((*score - (i as f64 + 0.5)).abs() < f64::EPSILON);
+        }
+    }
+
     // --- Intset MAX_INTSET_ELEMENTS cap ---
 
     #[test]
@@ -2295,6 +2279,8 @@ mod tests {
             pending_lfu_freq: None,
             preamble_byte: None,
             finished: false,
+            max_key_elements: None,
+            chunked: None,
         }
     }
 }

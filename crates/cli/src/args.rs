@@ -64,6 +64,15 @@ pub struct ExportArgs {
     /// Shard identifier for conflict-free parallel writes
     #[arg(long)]
     pub shard_id: Option<String>,
+
+    /// Maximum elements per collection chunk to bound memory [default: 50000].
+    /// Note: disables geo-key auto-detection for chunked sorted sets.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub max_key_elements: Option<usize>,
+
+    /// Disable collection chunking (read entire collections into memory)
+    #[arg(long, conflicts_with = "max_key_elements")]
+    pub no_chunking: bool,
 }
 
 #[derive(Parser)]

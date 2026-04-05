@@ -281,3 +281,46 @@ fn encodings_rdb_all_types_parsed() {
     let list_rows = total_rows(by_type.get(&TypeTag::List).unwrap());
     assert!(list_rows >= 505, "should have at least 500 (big_list) + 5 (small_list) = 505 list rows, got {list_rows}");
 }
+
+/// Parse encodings.rdb with chunking enabled (max_key_elements=50) and verify
+/// the total row counts match the non-chunked parse.
+#[test]
+fn encodings_rdb_chunked_same_row_counts() {
+    // First, get baseline counts without chunking
+    let (baseline, _) = collect_batches(&fixture_path("encodings.rdb"));
+    let baseline_hash = total_rows(baseline.get(&TypeTag::Hash).unwrap());
+    let baseline_set = total_rows(baseline.get(&TypeTag::Set).unwrap());
+    let baseline_list = total_rows(baseline.get(&TypeTag::List).unwrap());
+
+    // Now parse with chunking
+    let f = std::fs::File::open(fixture_path("encodings.rdb")).unwrap();
+    let reader = RdbReader::new(f).unwrap().with_max_key_elements(50);
+
+    let batcher = ArrowBatcher::new(BatcherConfig::default());
+    let mut by_type: HashMap<TypeTag, Vec<RecordBatch>> = HashMap::new();
+
+    for result in batcher.process(reader) {
+        let typed_batch = result.unwrap();
+        by_type
+            .entry(typed_batch.tag)
+            .or_default()
+            .push(typed_batch.batch);
+    }
+
+    let chunked_hash = total_rows(by_type.get(&TypeTag::Hash).unwrap());
+    let chunked_set = total_rows(by_type.get(&TypeTag::Set).unwrap());
+    let chunked_list = total_rows(by_type.get(&TypeTag::List).unwrap());
+
+    assert_eq!(
+        chunked_hash, baseline_hash,
+        "chunked hash rows ({chunked_hash}) should match baseline ({baseline_hash})"
+    );
+    assert_eq!(
+        chunked_set, baseline_set,
+        "chunked set rows ({chunked_set}) should match baseline ({baseline_set})"
+    );
+    assert_eq!(
+        chunked_list, baseline_list,
+        "chunked list rows ({chunked_list}) should match baseline ({baseline_list})"
+    );
+}

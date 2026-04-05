@@ -148,7 +148,8 @@ impl ListBatchBuilder {
 
     pub(crate) fn push(&mut self, entry: &RdbEntry) {
         if let RdbValue::List(ref elements) = entry.value {
-            let num_elements = elements.len() as u64;
+            let num_elements = entry.total_elements.unwrap_or(elements.len() as u64);
+            let offset = entry.element_offset.unwrap_or(0);
             if elements.is_empty() {
                 // Emit one row with nulls so the key isn't dropped.
                 self.common.append(entry, 0, entry.type_name());
@@ -158,7 +159,7 @@ impl ListBatchBuilder {
             } else {
                 for (i, elem) in elements.iter().enumerate() {
                     self.common.append(entry, num_elements, entry.type_name());
-                    self.index.append_value(i as u64);
+                    self.index.append_value(offset + i as u64);
                     self.element.append_value(elem);
                     self.len += 1;
                 }
@@ -210,7 +211,7 @@ impl SetBatchBuilder {
 
     pub(crate) fn push(&mut self, entry: &RdbEntry) {
         if let RdbValue::Set(ref members) = entry.value {
-            let num_elements = members.len() as u64;
+            let num_elements = entry.total_elements.unwrap_or(members.len() as u64);
             if members.is_empty() {
                 self.common.append(entry, 0, entry.type_name());
                 self.member.append_null();
@@ -270,7 +271,7 @@ impl SortedSetBatchBuilder {
 
     pub(crate) fn push(&mut self, entry: &RdbEntry) {
         if let RdbValue::SortedSet(ref pairs) = entry.value {
-            let num_elements = pairs.len() as u64;
+            let num_elements = entry.total_elements.unwrap_or(pairs.len() as u64);
             if pairs.is_empty() {
                 self.common.append(entry, 0, entry.type_name());
                 self.member.append_null();
@@ -335,7 +336,7 @@ impl HashBatchBuilder {
 
     pub(crate) fn push(&mut self, entry: &RdbEntry) {
         if let RdbValue::Hash(ref fields) = entry.value {
-            let num_elements = fields.len() as u64;
+            let num_elements = entry.total_elements.unwrap_or(fields.len() as u64);
             if fields.is_empty() {
                 self.common.append(entry, 0, entry.type_name());
                 self.field.append_null();
@@ -408,7 +409,7 @@ impl GeoBatchBuilder {
 
     pub(crate) fn push(&mut self, entry: &RdbEntry) {
         if let RdbValue::SortedSet(ref pairs) = entry.value {
-            let num_elements = pairs.len() as u64;
+            let num_elements = entry.total_elements.unwrap_or(pairs.len() as u64);
             if pairs.is_empty() {
                 self.common.append(entry, 0, "geo");
                 self.member.append_null();
@@ -754,5 +755,47 @@ mod tests {
         assert_eq!(enc.value(0), "dense");
         let card = batch.column(9).as_primitive::<Int64Type>();
         assert_eq!(card.value(0), 999);
+    }
+
+    #[test]
+    fn test_list_builder_with_element_offset() {
+        let mut b = ListBatchBuilder::new();
+        let mut entry = make_entry(RdbValue::List(vec![
+            b"x".to_vec(),
+            b"y".to_vec(),
+            b"z".to_vec(),
+        ]));
+        entry.total_elements = Some(300);
+        entry.element_offset = Some(100);
+        b.push(&entry);
+        assert_eq!(b.len(), 3);
+        let batch = b.finish().unwrap();
+
+        let indices = batch.column(8).as_primitive::<UInt64Type>();
+        assert_eq!(indices.value(0), 100);
+        assert_eq!(indices.value(1), 101);
+        assert_eq!(indices.value(2), 102);
+
+        let num_elem = batch.column(7).as_primitive::<UInt64Type>();
+        assert_eq!(num_elem.value(0), 300);
+    }
+
+    #[test]
+    fn test_num_elements_from_total_elements() {
+        let mut b = HashBatchBuilder::new();
+        let mut entry = make_entry(RdbValue::Hash(vec![
+            HashField { field: b"f1".to_vec(), value: b"v1".to_vec(), expiry_ms: None },
+            HashField { field: b"f2".to_vec(), value: b"v2".to_vec(), expiry_ms: None },
+            HashField { field: b"f3".to_vec(), value: b"v3".to_vec(), expiry_ms: None },
+        ]));
+        entry.total_elements = Some(1000);
+        b.push(&entry);
+        let batch = b.finish().unwrap();
+
+        // num_elements column should be 1000, not 3
+        let num_elem = batch.column(7).as_primitive::<UInt64Type>();
+        assert_eq!(num_elem.value(0), 1000);
+        assert_eq!(num_elem.value(1), 1000);
+        assert_eq!(num_elem.value(2), 1000);
     }
 }

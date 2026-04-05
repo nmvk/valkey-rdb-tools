@@ -89,10 +89,12 @@ pub fn type_tag_for(entry: &RdbEntry) -> Option<TypeTag> {
         RdbValue::List(_) => Some(TypeTag::List),
         RdbValue::Set(_) => Some(TypeTag::Set),
         RdbValue::SortedSet(members) => {
-            if detect::is_geo(members) {
-                Some(TypeTag::Geo)
-            } else {
+            // Skip geo detection for chunked entries — partial view may
+            // give false positives (e.g. chunk of only integer scores)
+            if entry.total_elements.is_some() || !detect::is_geo(members) {
                 Some(TypeTag::SortedSet)
+            } else {
+                Some(TypeTag::Geo)
             }
         }
         RdbValue::Hash(_) => Some(TypeTag::Hash),

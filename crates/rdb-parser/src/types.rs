@@ -111,6 +111,15 @@ pub struct RdbEntry {
 
     /// LFU frequency counter 0-255 (from FREQ opcode).
     pub lfu_frequency: Option<u8>,
+
+    /// Total element count across all chunks. `None` = complete (non-chunked) entry.
+    /// `Some(N)` = this entry is one chunk of an N-element collection.
+    pub total_elements: Option<u64>,
+
+    /// Offset of the first element in this chunk within the full collection.
+    /// Used by list builders for correct index computation.
+    /// `None` when not chunked or not applicable.
+    pub element_offset: Option<u64>,
 }
 
 impl RdbEntry {

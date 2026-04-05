@@ -15,5 +15,7 @@ pub(crate) fn test_entry_typed(key: &[u8], value: RdbValue, type_code: u8) -> Rd
         expiry_ms: None,
         lru_idle_secs: None,
         lfu_frequency: None,
+        total_elements: None,
+        element_offset: None,
     }
 }

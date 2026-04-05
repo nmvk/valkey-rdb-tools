@@ -30,6 +30,13 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let reader = RdbReader::new(input)?;
+    let reader = if args.no_chunking {
+        reader.without_chunking()
+    } else if let Some(max) = args.max_key_elements {
+        reader.with_max_key_elements(max)
+    } else {
+        reader // uses DEFAULT_MAX_KEY_ELEMENTS
+    };
     let metadata = metadata_from_rdb(reader.metadata());
 
     // Determine output directory
