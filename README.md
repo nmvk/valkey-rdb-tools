@@ -57,6 +57,14 @@ valkey-rdb export dump.rdb --compression snappy
 valkey-rdb export dump.rdb --batch-bytes 50mb --max-entry-bytes 10mb
 ```
 
+### validate
+
+Verify exported Parquet files match the source RDB (row counts per type, CRC-64, metadata):
+
+```bash
+valkey-rdb validate dump.rdb output/
+```
+
 ### schema
 
 Print the Arrow schema for each type, or a specific one:
@@ -105,7 +113,7 @@ rdb-parser  -->  rdb-to-arrow  -->  cli / python
 
 - **[rdb-parser](crates/rdb-parser/)** — Zero-dependency RDB parser. Reads the binary format and yields `RdbEntry` items via `Iterator`.
 - **[rdb-to-arrow](crates/rdb-to-arrow/)** — Converts entries into Arrow RecordBatches. Handles virtual type detection (HyperLogLog exclusive from strings; Geo additive alongside sorted sets), batching, and writing to all output formats.
-- **[cli](crates/cli/)** — The `valkey-rdb` binary. Two commands: `export` and `schema`.
+- **[cli](crates/cli/)** — The `valkey-rdb` binary. Commands: `export`, `schema`, and `validate`.
 - **[python](crates/python/)** — PyO3 bindings exposing `read()`, `read_batches()`, `to_parquet()`, and `inspect()`.
 
 ### Type support

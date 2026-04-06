@@ -36,6 +36,12 @@ Options:
 
 Output files are named `{type}.{ext}` (e.g., `string.parquet`, `hash.parquet`).
 
+### validate
+
+```bash
+valkey-rdb validate dump.rdb output/       # Compare RDB row counts vs Parquet
+```
+
 ### schema
 
 ```bash

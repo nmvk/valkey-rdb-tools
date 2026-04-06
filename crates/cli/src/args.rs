@@ -43,6 +43,8 @@ pub enum Command {
     Export(ExportArgs),
     /// Print Arrow schema for each type
     Schema(SchemaArgs),
+    /// Validate exported Parquet files against the source RDB
+    Validate(ValidateArgs),
 }
 
 #[derive(Parser)]
@@ -112,6 +114,15 @@ pub struct SchemaArgs {
     /// Output format
     #[arg(long, default_value = "text")]
     pub output: OutputFormat,
+}
+
+#[derive(Parser)]
+pub struct ValidateArgs {
+    /// Path to the source RDB file
+    pub file: String,
+
+    /// Path to the export output directory
+    pub output: String,
 }
 
 #[derive(Clone, ValueEnum)]
