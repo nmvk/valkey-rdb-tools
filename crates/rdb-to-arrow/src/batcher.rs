@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use arrow::array::RecordBatch;
@@ -10,9 +11,12 @@ use crate::builders::{
 use crate::error::ArrowConvertError;
 use rdb_parser::{RdbEntry, RdbValue};
 
-use crate::schema::{type_tag_for, is_geo_entry, TypeTag};
+use crate::schema::{type_tag_for, is_geo_entry, Heuristic, TypeTag};
 
 /// Configuration for the Arrow batcher.
+///
+/// Use [`Default::default()`] or struct literal syntax with `..Default::default()`
+/// to construct, so new fields added in future versions don't break your code.
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {
     /// Approximate row threshold per RecordBatch. A flush is triggered after
@@ -27,6 +31,8 @@ pub struct BatcherConfig {
     /// Skip RDB entries whose estimated in-memory size exceeds this threshold.
     /// Prevents a single large key from blowing up memory. `None` disables.
     pub max_entry_bytes: Option<usize>,
+    /// Active heuristic detectors for virtual types. Default: all built-in heuristics.
+    pub heuristics: HashSet<Heuristic>,
 }
 
 impl Default for BatcherConfig {
@@ -35,6 +41,7 @@ impl Default for BatcherConfig {
             batch_size: 65_536,
             batch_bytes: None,
             max_entry_bytes: None,
+            heuristics: Heuristic::ALL.iter().copied().collect(),
         }
     }
 }
@@ -121,8 +128,10 @@ impl ArrowBatcher {
             TypeTag::HyperLogLog => self.hll.push(entry),
         }
 
-        // Additive geo: also push to geo builder if it looks like geo data
-        let also_geo = tag == TypeTag::SortedSet && is_geo_entry(entry);
+        // Additive geo: also push to geo builder if heuristic is enabled
+        let also_geo = self.config.heuristics.contains(&Heuristic::Geo)
+            && tag == TypeTag::SortedSet
+            && is_geo_entry(entry);
         if also_geo {
             self.geo.push(entry);
         }
@@ -423,6 +432,30 @@ mod tests {
     }
 
     #[test]
+    fn geo_heuristic_disabled_no_geo_output() {
+        // When geo heuristic is disabled, valid geohash scores produce only SortedSet.
+        let mut batcher = ArrowBatcher::new(BatcherConfig {
+            batch_size: 100,
+            heuristics: HashSet::new(), // no heuristics
+            ..Default::default()
+        });
+        batcher
+            .push(&geo_entry(
+                b"places",
+                vec![
+                    (b"A".to_vec(), 3479099956230698.0),
+                    (b"B".to_vec(), 3663941556696959.0),
+                ],
+            ))
+            .unwrap();
+        let batches = batcher.flush().unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].tag, TypeTag::SortedSet);
+        assert_eq!(batches[0].batch.num_rows(), 2);
+    }
+
+    #[test]
     fn regular_string_not_hll() {
         let mut batcher = ArrowBatcher::new(config(100));
         batcher.push(&string_entry(b"s1", b"hello")).unwrap();
@@ -454,6 +487,7 @@ mod tests {
             batch_size: 1000, // high row limit — won't trigger
             batch_bytes: Some(20), // ~20 bytes budget
             max_entry_bytes: None,
+            ..Default::default()
         });
 
         // Each string entry contributes key.len() + value.len() bytes.
@@ -476,6 +510,7 @@ mod tests {
             batch_size: 1000,
             batch_bytes: Some(15),
             max_entry_bytes: None,
+            ..Default::default()
         });
 
         // Push 2 entries (~14 bytes), then a 3rd triggers flush (~21 bytes)
@@ -498,6 +533,7 @@ mod tests {
             batch_size: 100,
             batch_bytes: None,
             max_entry_bytes: Some(50), // skip entries > 50 bytes
+            ..Default::default()
         });
 
         // Small entry: key(2) + value(5) = 7 → allowed
@@ -518,6 +554,7 @@ mod tests {
             batch_size: 100,
             batch_bytes: None,
             max_entry_bytes: Some(10), // skip entries > 10 bytes
+            ..Default::default()
         });
 
         // Exactly 10 bytes: key(2) + value(8) = 10 → allowed

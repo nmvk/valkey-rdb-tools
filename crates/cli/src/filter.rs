@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 
 use rdb_parser::RdbEntry;
-use rdb_to_arrow::{is_geo_entry, TypeTag};
+use rdb_to_arrow::{is_geo_entry, Heuristic, TypeTag};
 
 /// Filters RDB entries by database, type tags, and key glob pattern.
 pub struct EntryFilter {
     pub db: Option<u32>,
     pub type_tags: Option<HashSet<TypeTag>>,
     pub key_pattern: Option<String>,
+    pub heuristics: HashSet<Heuristic>,
 }
 
 impl EntryFilter {
@@ -44,8 +45,12 @@ impl EntryFilter {
         if tags.contains(&primary) {
             return true;
         }
-        // A sorted set that looks like geo also matches TypeTag::Geo
-        if primary == TypeTag::SortedSet && tags.contains(&TypeTag::Geo) && is_geo_entry(entry) {
+        // A sorted set that looks like geo also matches TypeTag::Geo (only when heuristic is active)
+        if self.heuristics.contains(&Heuristic::Geo)
+            && primary == TypeTag::SortedSet
+            && tags.contains(&TypeTag::Geo)
+            && is_geo_entry(entry)
+        {
             return true;
         }
         false

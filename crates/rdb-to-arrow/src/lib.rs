@@ -9,7 +9,7 @@ pub(crate) mod test_helpers;
 
 pub use batcher::{ArrowBatcher, BatchIterator, BatcherConfig, TypedBatch};
 pub use error::ArrowConvertError;
-pub use schema::{schema_for, type_tag_for, is_geo_entry, TypeTag};
+pub use schema::{schema_for, type_tag_for, is_geo_entry, Heuristic, TypeTag};
 pub use writer::write_arrow_ipc;
 #[cfg(feature = "parquet")]
 pub use writer::{metadata_from_rdb, write_parquet, ParquetConfig};

@@ -3,6 +3,38 @@ use rdb_parser::{RdbEntry, RdbValue};
 
 use crate::detect;
 
+/// Named heuristic detectors for virtual types.
+///
+/// Heuristics detect virtual types that aren't native RDB types but can be
+/// inferred from data patterns (e.g., geo coordinates stored as sorted set
+/// scores). Use [`BatcherConfig::heuristics`](crate::BatcherConfig) to control
+/// which detectors are active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Heuristic {
+    /// Detect geo data from sorted sets with 52-bit geohash scores.
+    Geo,
+}
+
+impl Heuristic {
+    /// All built-in heuristics.
+    pub const ALL: &[Heuristic] = &[Heuristic::Geo];
+
+    /// Parse a CLI-friendly heuristic name. Case-insensitive.
+    pub fn from_name(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("geo") {
+            Some(Heuristic::Geo)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Heuristic::Geo => "geo",
+        }
+    }
+}
+
 /// Logical type tag for an RDB entry, used to route entries to the correct schema and builder.
 ///
 /// Ord is derived from variant declaration order (String < List < ... < HyperLogLog).

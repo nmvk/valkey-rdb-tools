@@ -1,5 +1,8 @@
+use std::collections::HashSet;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use parquet::basic::Compression;
+use rdb_to_arrow::Heuristic;
 
 fn parse_positive_usize(s: &str) -> Result<usize, String> {
     let n: usize = s.parse().map_err(|e| format!("{e}"))?;
@@ -103,6 +106,10 @@ pub struct ExportArgs {
     /// Skip entries larger than this size (e.g. 1mb, 10mb)
     #[arg(long, value_parser = parse_byte_size)]
     pub max_entry_bytes: Option<usize>,
+
+    /// Heuristic detectors for virtual types (comma-separated: all, geo, none)
+    #[arg(long, default_value = "all")]
+    pub heuristic: String,
 }
 
 #[derive(Parser)]
@@ -123,6 +130,27 @@ pub struct ValidateArgs {
 
     /// Path to the export output directory
     pub output: String,
+}
+
+/// Parse a comma-separated heuristic string into a set.
+///
+/// Accepts "all" (every built-in heuristic), "none" (empty set), "geo",
+/// or comma-separated combinations.
+pub fn parse_heuristics(s: &str) -> Result<HashSet<Heuristic>, Box<dyn std::error::Error>> {
+    if s.eq_ignore_ascii_case("all") {
+        return Ok(Heuristic::ALL.iter().copied().collect());
+    }
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(HashSet::new());
+    }
+    let mut set = HashSet::new();
+    for name in s.split(',') {
+        let name = name.trim();
+        set.insert(Heuristic::from_name(name).ok_or_else(|| {
+            format!("unknown heuristic '{name}'. Valid: all, geo, none")
+        })?);
+    }
+    Ok(set)
 }
 
 #[derive(Clone, ValueEnum)]

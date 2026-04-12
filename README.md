@@ -55,6 +55,9 @@ valkey-rdb export dump.rdb --compression snappy
 
 # Bound memory: flush builders at ~50 MB, skip entries over 10 MB
 valkey-rdb export dump.rdb --batch-bytes 50mb --max-entry-bytes 10mb
+
+# Disable geo heuristic detection
+valkey-rdb export dump.rdb --heuristic none
 ```
 
 ### validate
@@ -125,7 +128,7 @@ rdb-parser  -->  rdb-to-arrow  -->  cli / python
 | Set | hashtable, intset, listpack | 9 columns (one row per member) |
 | Sorted Set | v1, v2, ziplist, listpack | 10 columns (member + score) |
 | Hash | hashtable, ziplist, listpack, HASH_2 | 11 columns (field + value + per-field TTL) |
-| Geo (virtual, always-on) | Additive: sorted sets with geohash scores appear in both zset and geo output | 12 columns (member + lon/lat) |
+| Geo (virtual, `--heuristic geo`) | Additive: sorted sets with geohash scores appear in both zset and geo output | 12 columns (member + lon/lat) |
 | HyperLogLog (virtual, exclusive) | Detected from HYLL magic header; replaces string output | 11 columns (encoding + cardinality) |
 
 Streams and modules are skipped during parsing.

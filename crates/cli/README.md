@@ -33,6 +33,7 @@ Options:
 | `--batch-size` | 65536 | Rows per Arrow RecordBatch |
 | `--row-group-size` | 1048576 | Rows per Parquet row group |
 | `--shard-id` | none | Suffix for conflict-free parallel writes |
+| `--heuristic` | `all` | Virtual type detection (`all`, `geo`, `none`) |
 
 Output files are named `{type}.{ext}` (e.g., `string.parquet`, `hash.parquet`).
 

@@ -9,6 +9,7 @@ use rdb_to_arrow::{
     metadata_from_rdb, write_arrow_ipc, write_csv, write_json, write_parquet, ArrowBatcher,
     ArrowConvertError, BatcherConfig, ParquetConfig, TypeTag,
 };
+use crate::args::parse_heuristics;
 
 use crate::args::{ExportArgs, FormatArg};
 use crate::filter::{EntryFilter, FilteredEntries};
@@ -43,7 +44,7 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         reader // uses DEFAULT_MAX_KEY_ELEMENTS
     };
-    let metadata = metadata_from_rdb(reader.metadata());
+    let mut metadata = metadata_from_rdb(reader.metadata());
 
     // Determine output directory
     let output_dir = match &args.output {
@@ -64,18 +65,33 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Clone before moving into the filter — we need it again for batch-level output filtering.
     let output_tags = type_tags.clone();
+    let heuristics = parse_heuristics(&args.heuristic)?;
+
+    // Record active heuristics in Parquet metadata so validate can be self-describing.
+    let heuristic_str: String = if heuristics.is_empty() {
+        "none".to_string()
+    } else {
+        let mut names: Vec<&str> = heuristics.iter().map(|h| h.as_str()).collect();
+        names.sort();
+        names.join(",")
+    };
+    metadata.insert("rdb.heuristics".to_string(), heuristic_str);
 
     let filter = EntryFilter {
         db: args.db,
         type_tags,
         key_pattern: args.key_pattern.clone(),
+        heuristics: heuristics.clone(),
     };
 
     let filtered = FilteredEntries::new(reader, filter);
+    #[allow(clippy::needless_update)] // forward-compat guard for new BatcherConfig fields
     let batcher = ArrowBatcher::new(BatcherConfig {
         batch_size: args.batch_size,
         batch_bytes: args.batch_bytes,
         max_entry_bytes: args.max_entry_bytes,
+        heuristics: heuristics.clone(),
+        ..Default::default()
     });
     let raw_batches = batcher.process(filtered);
 

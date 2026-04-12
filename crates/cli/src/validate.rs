@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::Path;
 
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use rdb_parser::{RdbEntry, RdbError, RdbReader, RdbValue};
-use rdb_to_arrow::{is_geo_entry, type_tag_for, TypeTag};
+use rdb_to_arrow::{is_geo_entry, type_tag_for, Heuristic, TypeTag};
 
 use crate::args::ValidateArgs;
 
@@ -14,7 +15,6 @@ struct TypeCounts {
 }
 
 struct RdbSummary {
-    server_version: Option<String>,
     magic: String,
     rdb_version: u32,
     counts: BTreeMap<TypeTag, TypeCounts>,
@@ -31,11 +31,10 @@ fn entry_row_count(entry: &RdbEntry) -> u64 {
     }
 }
 
-fn count_rdb(path: &str) -> Result<RdbSummary, Box<dyn std::error::Error>> {
+fn count_rdb(path: &str, heuristics: &HashSet<Heuristic>) -> Result<RdbSummary, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = RdbReader::new(file)?;
     let header = reader.header().clone();
-    let server_version = reader.metadata().server_version().map(|s| s.to_string());
 
     let mut counts: BTreeMap<TypeTag, TypeCounts> = BTreeMap::new();
 
@@ -64,7 +63,10 @@ fn count_rdb(path: &str) -> Result<RdbSummary, Box<dyn std::error::Error>> {
         tc.rows += row_count;
 
         // Geo is additive: sorted sets with geohash scores also appear as geo
-        if tag == TypeTag::SortedSet && is_geo_entry(&entry) {
+        if heuristics.contains(&Heuristic::Geo)
+            && tag == TypeTag::SortedSet
+            && is_geo_entry(&entry)
+        {
             let gc = counts
                 .entry(TypeTag::Geo)
                 .or_insert(TypeCounts { keys: 0, rows: 0 });
@@ -76,7 +78,6 @@ fn count_rdb(path: &str) -> Result<RdbSummary, Box<dyn std::error::Error>> {
     }
 
     Ok(RdbSummary {
-        server_version,
         magic: header.magic.to_string(),
         rdb_version: header.version,
         counts,
@@ -125,30 +126,74 @@ fn count_parquet(dir: &str) -> Result<BTreeMap<TypeTag, u64>, Box<dyn std::error
     Ok(counts)
 }
 
-fn check_parquet_metadata(
-    dir: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    // The metadata is stored in the Arrow schema (embedded in the Parquet footer),
-    // not in the Parquet file-level key_value_metadata.
+struct ParquetMeta {
+    has_exported_by: bool,
+    heuristics: HashSet<Heuristic>,
+}
+
+/// Find any Parquet file in `dir` — base (`{type}.parquet`) or shard (`{type}.*.parquet`).
+/// Returns the path to the first one found, or None.
+fn find_any_parquet(dir: &str) -> Option<std::path::PathBuf> {
+    let dir_path = Path::new(dir);
     for tag in TypeTag::ALL {
-        let path = Path::new(dir).join(format!("{}.parquet", tag.as_str()));
-        if !path.exists() {
-            continue;
+        // Check base file first
+        let base = dir_path.join(format!("{}.parquet", tag.as_str()));
+        if base.exists() {
+            return Some(base);
         }
-        let file = File::open(&path)?;
-        let reader = SerializedFileReader::new(file)?;
-        let file_meta = reader.metadata().file_metadata();
-        let arrow_meta =
-            parquet::arrow::parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata());
-        if let Ok(schema) = arrow_meta {
-            if schema.metadata().contains_key("rdb.exported_by") {
-                return Ok(true);
+        // Check shard files
+        let glob_pattern = format!("{}.*.parquet", tag.as_str());
+        if let Ok(entries) = std::fs::read_dir(dir_path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if glob_match::glob_match(&glob_pattern, &name_str) {
+                    return Some(entry.path());
+                }
             }
         }
-        // Only need to check the first existing file
-        return Ok(false);
     }
-    Ok(false)
+    None
+}
+
+fn read_parquet_metadata(
+    dir: &str,
+) -> Result<ParquetMeta, Box<dyn std::error::Error>> {
+    let path = match find_any_parquet(dir) {
+        Some(p) => p,
+        None => {
+            return Ok(ParquetMeta {
+                has_exported_by: false,
+                heuristics: Heuristic::ALL.iter().copied().collect(),
+            });
+        }
+    };
+
+    let file = File::open(&path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let file_meta = reader.metadata().file_metadata();
+    let arrow_meta =
+        parquet::arrow::parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata());
+
+    if let Ok(schema) = arrow_meta {
+        let meta = schema.metadata();
+        let has_exported_by = meta.contains_key("rdb.exported_by");
+        let heuristics = match meta.get("rdb.heuristics") {
+            Some(s) if s == "none" => HashSet::new(),
+            Some(s) => s
+                .split(',')
+                .filter_map(|name| Heuristic::from_name(name.trim()))
+                .collect(),
+            // No rdb.heuristics key → legacy export, assume all heuristics were on
+            None => Heuristic::ALL.iter().copied().collect(),
+        };
+        return Ok(ParquetMeta { has_exported_by, heuristics });
+    }
+
+    Ok(ParquetMeta {
+        has_exported_by: false,
+        heuristics: Heuristic::ALL.iter().copied().collect(),
+    })
 }
 
 fn format_num(n: u64) -> String {
@@ -164,20 +209,19 @@ fn format_num(n: u64) -> String {
 }
 
 pub fn run(args: &ValidateArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let rdb = count_rdb(&args.file)?;
+    let parquet_meta = read_parquet_metadata(&args.output)?;
+    let rdb = count_rdb(&args.file, &parquet_meta.heuristics)?;
 
     eprintln!(
-        "RDB: {} ({} {}, RDB v{})",
+        "RDB: {} ({}, RDB v{})",
         args.file,
         rdb.magic,
-        rdb.server_version.as_deref().unwrap_or("unknown"),
         rdb.rdb_version,
     );
     eprintln!("CRC-64: verified");
     eprintln!();
 
     let parquet_counts = count_parquet(&args.output)?;
-    let has_metadata = check_parquet_metadata(&args.output)?;
 
     // Collect all types present in either RDB or Parquet
     let mut all_tags: Vec<TypeTag> = Vec::new();
@@ -249,7 +293,7 @@ pub fn run(args: &ValidateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let total = pass_count + fail_count;
     eprintln!();
 
-    if !has_metadata {
+    if !parquet_meta.has_exported_by {
         eprintln!("Warning: rdb.exported_by metadata tag not found in Parquet files");
     }
 
