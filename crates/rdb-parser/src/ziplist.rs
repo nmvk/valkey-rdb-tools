@@ -11,8 +11,16 @@
 //
 // String lengths are BIG endian. Integer data is LITTLE endian.
 
-use crate::compact::{sign_extend, CompactEntry};
+use crate::compact::{self, CompactEntry};
 use crate::types::RdbError;
+
+fn checked_add(a: usize, b: usize, ctx: &str) -> Result<usize, RdbError> {
+    compact::checked_add(a, b, "ziplist", ctx)
+}
+
+fn ensure_len(buf: &[u8], need: usize, ctx: &str) -> Result<(), RdbError> {
+    compact::ensure_len(buf, need, "ziplist", ctx)
+}
 
 const ZL_HDR_SIZE: usize = 10;
 const ZL_END: u8 = 0xFF;
@@ -35,17 +43,10 @@ pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
         )));
     }
 
-    // Read zllen from header for pre-allocation hint.
-    // 0xFFFF means count > 65534, must scan to determine.
+    // Pre-allocation hint from the `zllen` header field. `0xFFFF` means
+    // "count > 65534, must scan to determine"; see `compact::capacity_hint`.
     let zllen = u16::from_le_bytes([data[8], data[9]]);
-    let capacity = if zllen == 0xFFFF {
-        256 // reasonable default when count is unknown
-    } else {
-        // Cap to blob size — each entry occupies at least 1 byte, so zllen
-        // cannot legitimately exceed data.len(). Prevents a crafted header
-        // from causing a huge allocation before parsing begins.
-        (zllen as usize).min(data.len())
-    };
+    let capacity = compact::capacity_hint(zllen, data.len());
 
     let mut pos = ZL_HDR_SIZE;
     let mut entries = Vec::with_capacity(capacity);
@@ -197,9 +198,7 @@ fn decode_int_entry(buf: &[u8]) -> Result<(CompactEntry, usize), RdbError> {
         // 0xF0 — 24-bit signed int LE
         0xF0 => {
             ensure_len(buf, 4, "24-bit int")?;
-            let raw = (buf[1] as u32) | ((buf[2] as u32) << 8) | ((buf[3] as u32) << 16);
-            let val = sign_extend(raw as u64, 24);
-            Ok((CompactEntry::Int(val), 4))
+            Ok((CompactEntry::Int(compact::read_i24_le(buf, 1)), 4))
         }
 
         // 0xFE — 8-bit signed int
@@ -220,24 +219,6 @@ fn decode_int_entry(buf: &[u8]) -> Result<(CompactEntry, usize), RdbError> {
             enc
         ))),
     }
-}
-
-fn checked_add(a: usize, b: usize, ctx: &str) -> Result<usize, RdbError> {
-    a.checked_add(b).ok_or_else(|| {
-        RdbError::CorruptData(format!("ziplist {}: length overflow", ctx))
-    })
-}
-
-fn ensure_len(buf: &[u8], need: usize, ctx: &str) -> Result<(), RdbError> {
-    if buf.len() < need {
-        return Err(RdbError::CorruptData(format!(
-            "ziplist {}: need {} bytes, have {}",
-            ctx,
-            need,
-            buf.len()
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

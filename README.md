@@ -130,8 +130,8 @@ rdb-parser  -->  rdb-to-arrow  -->  cli / python
 | Hash | hashtable, ziplist, listpack, HASH_2 | 11 columns (field + value + per-field TTL) |
 | Geo (virtual, `--heuristic geo`) | Additive: sorted sets with geohash scores appear in both zset and geo output | 12 columns (member + lon/lat) |
 | HyperLogLog (virtual, exclusive) | Detected from HYLL magic header; replaces string output | 11 columns (encoding + cardinality) |
-
-Streams and modules are skipped during parsing.
+| Module | All module types (`RDB_TYPE_MODULE_2`) | 15 columns (one row per module sub-value) |
+| Stream | LISTPACKS, LISTPACKS_2, LISTPACKS_3 | 11 columns (one row per field-value per entry) |
 
 ### Design choices
 

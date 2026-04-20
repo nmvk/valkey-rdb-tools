@@ -32,7 +32,7 @@ for entry in reader {
 - **Key metadata**: Expiry (ms), LRU idle time, LFU frequency
 - **Integrity**: CRC-64 checksum validation
 
-Streams and modules are skipped (the parser stays aligned but does not decode their contents).
+Module data is fully parsed into typed values. Streams are fully decoded including delta-encoded listpack entries across all three encoding versions (LISTPACKS, LISTPACKS_2, LISTPACKS_3).
 
 ## Design
 

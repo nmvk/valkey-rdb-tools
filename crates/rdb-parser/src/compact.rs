@@ -50,6 +50,54 @@ pub(crate) fn sign_extend(raw: u64, bits: u32) -> i64 {
     ((raw << shift) as i64) >> shift
 }
 
+/// Read a 24-bit little-endian signed integer from `buf` at `offset`,
+/// returning it sign-extended to `i64`. Caller must have already verified
+/// that `buf[offset..offset + 3]` is in bounds.
+///
+/// Duplicated between listpack and ziplist before this was extracted: both
+/// encodings use a 3-byte LE wire representation for 24-bit ints.
+pub(crate) fn read_i24_le(buf: &[u8], offset: usize) -> i64 {
+    let raw = (buf[offset] as u32)
+        | ((buf[offset + 1] as u32) << 8)
+        | ((buf[offset + 2] as u32) << 16);
+    sign_extend(raw as u64, 24)
+}
+
+/// Pre-allocation hint from a compact-encoding header count field.
+///
+/// Both listpack and ziplist store a 16-bit element count in their header
+/// with `0xFFFF` as a sentinel for "unknown, must scan". Returns a sane
+/// initial `Vec::with_capacity` value: the default when the count is the
+/// sentinel, otherwise `count.min(blob_len)` so a crafted header cannot
+/// force a multi-GB allocation (since every entry is at least 1 byte).
+pub(crate) fn capacity_hint(count_field: u16, blob_len: usize) -> usize {
+    const UNKNOWN_COUNT_DEFAULT: usize = 256;
+    const SENTINEL: u16 = 0xFFFF;
+    if count_field == SENTINEL {
+        UNKNOWN_COUNT_DEFAULT
+    } else {
+        (count_field as usize).min(blob_len)
+    }
+}
+
+/// Checked addition with a context message for corrupt data errors.
+pub(crate) fn checked_add(a: usize, b: usize, format: &str, ctx: &str) -> Result<usize, RdbError> {
+    a.checked_add(b).ok_or_else(|| {
+        RdbError::CorruptData(format!("{format} {ctx}: length overflow"))
+    })
+}
+
+/// Ensure a buffer has at least `need` bytes, or return a corrupt data error.
+pub(crate) fn ensure_len(buf: &[u8], need: usize, format: &str, ctx: &str) -> Result<(), RdbError> {
+    if buf.len() < need {
+        return Err(RdbError::CorruptData(format!(
+            "{format} {ctx}: need {need} bytes, have {}",
+            buf.len()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

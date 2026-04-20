@@ -2,6 +2,7 @@ use std::fmt;
 
 /// Errors that can occur during RDB-to-Arrow conversion.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ArrowConvertError {
     /// Error from the RDB parser.
     Parser(rdb_parser::RdbError),

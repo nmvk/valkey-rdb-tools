@@ -5,13 +5,14 @@ use arrow::array::RecordBatch;
 use rdb_parser::RdbError;
 
 use crate::builders::{
-    GeoBatchBuilder, HashBatchBuilder, HllBatchBuilder, ListBatchBuilder, SetBatchBuilder,
-    SortedSetBatchBuilder, StringBatchBuilder,
+    BatchBuilder, GeoBatchBuilder, HashBatchBuilder, HllBatchBuilder, ListBatchBuilder,
+    ModuleBatchBuilder, SetBatchBuilder, SortedSetBatchBuilder, StreamBatchBuilder,
+    StringBatchBuilder,
 };
 use crate::error::ArrowConvertError;
 use rdb_parser::{RdbEntry, RdbValue};
 
-use crate::schema::{type_tag_for, is_geo_entry, Heuristic, TypeTag};
+use crate::schema::{should_emit_geo, type_tag_for, Heuristic, TypeTag};
 
 /// Configuration for the Arrow batcher.
 ///
@@ -39,30 +40,63 @@ impl Default for BatcherConfig {
     fn default() -> Self {
         Self {
             batch_size: 65_536,
-            batch_bytes: None,
+            batch_bytes: Some(64 * 1024 * 1024), // 64 MB per builder (9 builders ≈ 576 MB peak)
             max_entry_bytes: None,
             heuristics: Heuristic::ALL.iter().copied().collect(),
         }
     }
 }
 
-/// Estimate the variable-length data size of an RDB entry (key + value payload).
+/// Estimate the variable-length data size of an RDB entry in Arrow output.
+///
+/// For collection types, each element becomes a row with a copy of the key,
+/// so the key size is multiplied by element count.
 fn estimate_entry_bytes(entry: &RdbEntry) -> usize {
-    entry.key.len()
-        + match &entry.value {
-            RdbValue::String(v) => v.len(),
-            RdbValue::List(elems) => elems.iter().map(|e| e.len()).sum(),
-            RdbValue::Set(members) => members.iter().map(|m| m.len()).sum(),
-            RdbValue::SortedSet(pairs) => pairs.iter().map(|(m, _)| m.len() + 8).sum(),
-            RdbValue::Hash(fields) => fields.iter().map(|f| f.field.len() + f.value.len()).sum(),
-            _ => 0,
+    let key_len = entry.key.len();
+    match &entry.value {
+        RdbValue::String(v) => key_len + v.len(),
+        RdbValue::List(elems) => {
+            let rows = elems.len().max(1);
+            key_len * rows + elems.iter().map(|e| e.len()).sum::<usize>()
         }
+        RdbValue::Set(members) => {
+            let rows = members.len().max(1);
+            key_len * rows + members.iter().map(|m| m.len()).sum::<usize>()
+        }
+        RdbValue::SortedSet(pairs) => {
+            let rows = pairs.len().max(1);
+            key_len * rows + pairs.iter().map(|(m, _)| m.len() + 8).sum::<usize>()
+        }
+        RdbValue::Hash(fields) => {
+            let rows = fields.len().max(1);
+            key_len * rows + fields.iter().map(|f| f.field.len() + f.value.len()).sum::<usize>()
+        }
+        RdbValue::Stream(data) => {
+            let rows: usize = data.entries.iter().map(|e| e.fields.len().max(1)).sum();
+            let rows = rows.max(1);
+            key_len * rows + data.entries.iter().map(|e| {
+                e.fields.iter().map(|(f, v)| f.len() + v.len()).sum::<usize>()
+            }).sum::<usize>()
+        }
+        RdbValue::Module(data) => {
+            let rows = data.values.len().max(1);
+            key_len * rows + data.values.iter().map(|v| match v {
+                rdb_parser::ModuleValue::String(s) => s.len(),
+                _ => 8,
+            }).sum::<usize>()
+        }
+        _ => key_len,
+    }
 }
 
 /// A RecordBatch tagged with its logical type.
 #[derive(Debug)]
 pub struct TypedBatch {
+    /// The logical RDB type this batch's rows were built for. Determines
+    /// which schema the `batch` conforms to and which output file it
+    /// should be written to.
     pub tag: TypeTag,
+    /// The Arrow record batch itself. Shape is `schema_for(tag)`.
     pub batch: RecordBatch,
 }
 
@@ -80,9 +114,19 @@ pub struct ArrowBatcher {
     hash: HashBatchBuilder,
     geo: GeoBatchBuilder,
     hll: HllBatchBuilder,
+    module: ModuleBatchBuilder,
+    stream: StreamBatchBuilder,
+    /// Count of entries silently dropped because their estimated size
+    /// exceeded [`BatcherConfig::max_entry_bytes`]. Exposed via
+    /// [`ArrowBatcher::skipped_oversized`] and
+    /// [`BatchIterator::skipped_oversized_count`].
+    skipped_oversized: u64,
 }
 
 impl ArrowBatcher {
+    /// Construct a batcher with the given configuration. All builders start
+    /// empty; rows accumulate as [`push`](Self::push) is called and flush
+    /// either automatically (on threshold) or via [`flush`](Self::flush).
     pub fn new(config: BatcherConfig) -> Self {
         Self {
             config,
@@ -93,6 +137,33 @@ impl ArrowBatcher {
             hash: HashBatchBuilder::new(),
             geo: GeoBatchBuilder::new(),
             hll: HllBatchBuilder::new(),
+            module: ModuleBatchBuilder::new(),
+            stream: StreamBatchBuilder::new(),
+            skipped_oversized: 0,
+        }
+    }
+
+    /// Number of entries dropped because their estimated size exceeded
+    /// [`BatcherConfig::max_entry_bytes`]. Useful for surfacing a
+    /// "N keys skipped" warning at the end of an export run.
+    pub fn skipped_oversized(&self) -> u64 {
+        self.skipped_oversized
+    }
+
+    /// Route a [`TypeTag`] to the matching builder. This is the only place
+    /// that has to know about every builder field — `push`, flushing, and
+    /// finalization all dispatch through the [`BatchBuilder`] trait.
+    fn builder_mut(&mut self, tag: TypeTag) -> &mut dyn BatchBuilder {
+        match tag {
+            TypeTag::String => &mut self.string,
+            TypeTag::List => &mut self.list,
+            TypeTag::Set => &mut self.set,
+            TypeTag::SortedSet => &mut self.zset,
+            TypeTag::Hash => &mut self.hash,
+            TypeTag::Geo => &mut self.geo,
+            TypeTag::HyperLogLog => &mut self.hll,
+            TypeTag::Module => &mut self.module,
+            TypeTag::Stream => &mut self.stream,
         }
     }
 
@@ -108,30 +179,21 @@ impl ArrowBatcher {
     ) -> Result<Vec<TypedBatch>, ArrowConvertError> {
         let tag = match type_tag_for(entry) {
             Some(t) => t,
-            None => return Ok(vec![]), // skip unsupported types
+            None => return Ok(vec![]),
         };
 
-        // Skip entries that exceed the max entry size
         if let Some(max) = self.config.max_entry_bytes {
             if estimate_entry_bytes(entry) > max {
+                self.skipped_oversized = self.skipped_oversized.saturating_add(1);
                 return Ok(vec![]);
             }
         }
 
-        match tag {
-            TypeTag::String => self.string.push(entry),
-            TypeTag::List => self.list.push(entry),
-            TypeTag::Set => self.set.push(entry),
-            TypeTag::SortedSet => self.zset.push(entry),
-            TypeTag::Hash => self.hash.push(entry),
-            TypeTag::Geo => unreachable!("type_tag_for never returns Geo"),
-            TypeTag::HyperLogLog => self.hll.push(entry),
-        }
+        // `type_tag_for` never returns `Geo`; geo is additive (see below).
+        debug_assert!(tag != TypeTag::Geo, "type_tag_for should never return Geo");
+        self.builder_mut(tag).push(entry);
 
-        // Additive geo: also push to geo builder if heuristic is enabled
-        let also_geo = self.config.heuristics.contains(&Heuristic::Geo)
-            && tag == TypeTag::SortedSet
-            && is_geo_entry(entry);
+        let also_geo = should_emit_geo(&self.config.heuristics, tag, entry);
         if also_geo {
             self.geo.push(entry);
         }
@@ -147,13 +209,9 @@ impl ArrowBatcher {
     /// Flush all remaining rows from every builder.
     pub fn flush(&mut self) -> Result<Vec<TypedBatch>, ArrowConvertError> {
         let mut out = Vec::new();
-        self.flush_tag(TypeTag::String, &mut out)?;
-        self.flush_tag(TypeTag::List, &mut out)?;
-        self.flush_tag(TypeTag::Set, &mut out)?;
-        self.flush_tag(TypeTag::SortedSet, &mut out)?;
-        self.flush_tag(TypeTag::Hash, &mut out)?;
-        self.flush_tag(TypeTag::Geo, &mut out)?;
-        self.flush_tag(TypeTag::HyperLogLog, &mut out)?;
+        for tag in TypeTag::ALL {
+            self.flush_tag(tag, &mut out)?;
+        }
         Ok(out)
     }
 
@@ -168,6 +226,7 @@ impl ArrowBatcher {
             iter,
             pending: VecDeque::new(),
             finished: false,
+            skipped: 0,
         }
     }
 
@@ -176,14 +235,9 @@ impl ArrowBatcher {
         tag: TypeTag,
         out: &mut Vec<TypedBatch>,
     ) -> Result<(), ArrowConvertError> {
-        let (len, bytes) = match tag {
-            TypeTag::String => (self.string.len(), self.string.data_bytes()),
-            TypeTag::List => (self.list.len(), self.list.data_bytes()),
-            TypeTag::Set => (self.set.len(), self.set.data_bytes()),
-            TypeTag::SortedSet => (self.zset.len(), self.zset.data_bytes()),
-            TypeTag::Hash => (self.hash.len(), self.hash.data_bytes()),
-            TypeTag::Geo => (self.geo.len(), self.geo.data_bytes()),
-            TypeTag::HyperLogLog => (self.hll.len(), self.hll.data_bytes()),
+        let (len, bytes) = {
+            let b = self.builder_mut(tag);
+            (b.len(), b.data_bytes())
         };
         let row_exceeded = len >= self.config.batch_size;
         let bytes_exceeded = self.config.batch_bytes.is_some_and(|max| bytes >= max);
@@ -198,27 +252,11 @@ impl ArrowBatcher {
         tag: TypeTag,
         out: &mut Vec<TypedBatch>,
     ) -> Result<(), ArrowConvertError> {
-        let is_empty = match tag {
-            TypeTag::String => self.string.is_empty(),
-            TypeTag::List => self.list.is_empty(),
-            TypeTag::Set => self.set.is_empty(),
-            TypeTag::SortedSet => self.zset.is_empty(),
-            TypeTag::Hash => self.hash.is_empty(),
-            TypeTag::Geo => self.geo.is_empty(),
-            TypeTag::HyperLogLog => self.hll.is_empty(),
-        };
-        if is_empty {
+        let builder = self.builder_mut(tag);
+        if builder.is_empty() {
             return Ok(());
         }
-        let batch = match tag {
-            TypeTag::String => self.string.finish()?,
-            TypeTag::List => self.list.finish()?,
-            TypeTag::Set => self.set.finish()?,
-            TypeTag::SortedSet => self.zset.finish()?,
-            TypeTag::Hash => self.hash.finish()?,
-            TypeTag::Geo => self.geo.finish()?,
-            TypeTag::HyperLogLog => self.hll.finish()?,
-        };
+        let batch = builder.finish()?;
         out.push(TypedBatch { tag, batch });
         Ok(())
     }
@@ -230,6 +268,23 @@ pub struct BatchIterator<I> {
     iter: I,
     pending: VecDeque<TypedBatch>,
     finished: bool,
+    /// Number of entries skipped due to unsupported type (e.g., zipmap hash).
+    skipped: u64,
+}
+
+impl<I> BatchIterator<I> {
+    /// Returns the number of entries skipped due to unsupported types.
+    pub fn skipped_count(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Returns the number of entries dropped because their estimated size
+    /// exceeded [`BatcherConfig::max_entry_bytes`]. Separate from
+    /// [`Self::skipped_count`] so callers can distinguish "unsupported
+    /// type" from "too large to include".
+    pub fn skipped_oversized_count(&self) -> u64 {
+        self.batcher.skipped_oversized()
+    }
 }
 
 impl<I> Iterator for BatchIterator<I>
@@ -259,7 +314,8 @@ where
                     Err(e) => return Some(Err(e)),
                 },
                 Some(Err(RdbError::UnknownType(_))) => {
-                    // Unsupported type (stream, module) — skip silently.
+                    // Unsupported type (e.g., zipmap hash) — skip and count.
+                    self.skipped += 1;
                     continue;
                 }
                 Some(Err(e)) => return Some(Err(ArrowConvertError::Parser(e))),
@@ -569,25 +625,67 @@ mod tests {
     }
 
     #[test]
-    fn estimate_entry_bytes_string() {
-        let entry = string_entry(b"mykey", b"myvalue");
-        assert_eq!(estimate_entry_bytes(&entry), 5 + 7); // key + value
+    fn skipped_oversized_counter_tracks_dropped_entries() {
+        let mut batcher = ArrowBatcher::new(BatcherConfig {
+            batch_size: 100,
+            batch_bytes: None,
+            max_entry_bytes: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(batcher.skipped_oversized(), 0);
+
+        batcher.push(&string_entry(b"ok", b"fits")).unwrap();
+        assert_eq!(batcher.skipped_oversized(), 0, "small entry is not oversized");
+
+        batcher.push(&string_entry(b"big", &[b'x'; 100])).unwrap();
+        assert_eq!(batcher.skipped_oversized(), 1);
+
+        batcher.push(&string_entry(b"huge", &[b'y'; 200])).unwrap();
+        assert_eq!(batcher.skipped_oversized(), 2);
     }
 
     #[test]
-    fn estimate_entry_bytes_list() {
-        let entry = list_entry(b"lk", vec![b"aaa".to_vec(), b"bb".to_vec()]);
-        assert_eq!(estimate_entry_bytes(&entry), 2 + 3 + 2); // key + elem1 + elem2
+    fn batch_iterator_exposes_skipped_oversized_count() {
+        let entries: Vec<Result<RdbEntry, RdbError>> = vec![
+            Ok(string_entry(b"ok", b"fits")),
+            Ok(string_entry(b"big", &[b'x'; 100])),
+        ];
+        let config = BatcherConfig {
+            batch_size: 100,
+            max_entry_bytes: Some(10),
+            ..Default::default()
+        };
+        let mut iter = ArrowBatcher::new(config).process(entries.into_iter());
+        while iter.next().is_some() {}
+        assert_eq!(iter.skipped_oversized_count(), 1);
+        // Unrelated counter is unaffected by oversize skips.
+        assert_eq!(iter.skipped_count(), 0);
     }
 
+    /// Pin `estimate_entry_bytes` across the three most-different
+    /// variant shapes: string (no expansion), list (key × rows +
+    /// elements), and sorted set (key × rows + members + 8B scores).
+    /// Previously three near-identical tests; collapsed into one table.
     #[test]
-    fn estimate_entry_bytes_sorted_set() {
-        let entry = geo_entry(
-            b"zk",
-            vec![(b"member".to_vec(), 1.0)],
-        );
-        // key(2) + member(6) + 8 (f64) = 16
-        assert_eq!(estimate_entry_bytes(&entry), 2 + 6 + 8);
+    fn estimate_entry_bytes_table() {
+        let cases: Vec<(RdbEntry, usize)> = vec![
+            (string_entry(b"mykey", b"myvalue"), 5 + 7),
+            // list: key(2) × 2 rows + elem(3) + elem(2) = 9
+            (
+                list_entry(b"lk", vec![b"aaa".to_vec(), b"bb".to_vec()]),
+                2 * 2 + 3 + 2,
+            ),
+            // sorted set: key(2) + member(6) + score(8) = 16
+            (geo_entry(b"zk", vec![(b"member".to_vec(), 1.0)]), 2 + 6 + 8),
+        ];
+        for (entry, expected) in cases {
+            assert_eq!(
+                estimate_entry_bytes(&entry),
+                expected,
+                "unexpected estimate for {:?}",
+                entry.key
+            );
+        }
     }
 
     #[test]

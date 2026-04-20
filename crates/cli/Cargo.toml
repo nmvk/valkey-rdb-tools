@@ -17,4 +17,8 @@ rdb-to-arrow = { path = "../rdb-to-arrow" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 parquet = { workspace = true }
+# filter.rs key-pattern matching only; validate.rs no longer uses it.
 glob-match = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

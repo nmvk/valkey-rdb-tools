@@ -1,15 +1,16 @@
 use rdb_to_arrow::{schema_for, TypeTag};
 
 use crate::args::{OutputFormat, SchemaArgs};
+use crate::cli_error::CliError;
 
-pub fn run(args: &SchemaArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(args: &SchemaArgs) -> Result<(), CliError> {
     let tags: Vec<TypeTag> = match &args.type_name {
         Some(name) => {
             let tag = TypeTag::from_cli_name(name).ok_or_else(|| {
-                format!(
-                    "unknown type '{}'. Valid types: string, list, set, zset, hash, geo, hll",
-                    name
-                )
+                CliError::Usage(format!(
+                    "unknown type '{name}'. Valid types: {}",
+                    TypeTag::valid_cli_names()
+                ))
             })?;
             vec![tag]
         }
@@ -38,7 +39,7 @@ fn print_text(tags: &[TypeTag]) {
     }
 }
 
-fn print_json(tags: &[TypeTag]) -> Result<(), Box<dyn std::error::Error>> {
+fn print_json(tags: &[TypeTag]) -> Result<(), CliError> {
     let mut schemas = serde_json::Map::new();
 
     for &tag in tags {

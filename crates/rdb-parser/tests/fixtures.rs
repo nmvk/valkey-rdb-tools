@@ -192,18 +192,88 @@ fn hash_field_ttl() {
     );
 }
 
-// --- Streams (skip without crash) ---
+// --- Streams ---
+
+type ExpectedField = (&'static [u8], &'static [u8]);
+type ExpectedStreamEntry = (&'static str, &'static [ExpectedField]);
+
+/// Assert that a decoded stream's entries match the expected sequence of
+/// `(id, &[(field, value)])` tuples.
+fn assert_stream_entries_eq(
+    got: &[rdb_parser::StreamEntry],
+    want: &[ExpectedStreamEntry],
+) {
+    assert_eq!(got.len(), want.len(), "stream entry count");
+    for (se, (id, fields)) in got.iter().zip(want.iter()) {
+        assert_eq!(se.id, *id, "stream entry id");
+        assert_eq!(se.fields.len(), fields.len(), "field count for id {}", se.id);
+        for (actual, expected) in se.fields.iter().zip(fields.iter()) {
+            assert_eq!(actual.0.as_slice(), expected.0, "field name in id {}", se.id);
+            assert_eq!(actual.1.as_slice(), expected.1, "field value in id {}", se.id);
+        }
+    }
+}
 
 #[test]
-fn streams_no_crash() {
+fn streams_roundtrip() {
+    // streams.rdb contains two streams: `mystream` with three {name, age}
+    // entries (exercises the stream listpack SAMEFIELDS path) and
+    // `grouped_stream` with three event-log entries, one of which has a
+    // third field (exercises the non-SAMEFIELDS path) — plus a consumer
+    // group that the parser consumes but does not surface. These
+    // assertions pin the full decoded structure so regressions in stream
+    // IDs, field ordering, SAMEFIELDS handling, consumer-group skipping,
+    // or length/last_id propagation are caught.
+
     let f = std::fs::File::open(fixture_path("streams.rdb")).unwrap();
     let reader = RdbReader::new(f).unwrap();
-    let mut count = 0;
-    for entry in reader {
-        count += 1;
-        let _ = entry;
-    }
-    assert!(count > 0, "streams.rdb should have entries");
+    let entries: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+
+    let streams: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.value {
+            RdbValue::Stream(s) => Some((e.key.as_slice(), s)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streams.len(), 2, "expected two streams in streams.rdb");
+
+    let (_, mystream) = streams
+        .iter()
+        .find(|(k, _)| *k == b"mystream")
+        .expect("mystream key missing");
+    assert_eq!(mystream.length, 3);
+    assert_eq!(mystream.last_id, "1772784406058-0");
+    assert_stream_entries_eq(
+        &mystream.entries,
+        &[
+            ("1772784406052-0", &[(b"name", b"alice"), (b"age", b"30")]),
+            ("1772784406055-0", &[(b"name", b"bob"), (b"age", b"25")]),
+            ("1772784406058-0", &[(b"name", b"charlie"), (b"age", b"35")]),
+        ],
+    );
+
+    let (_, grouped) = streams
+        .iter()
+        .find(|(k, _)| *k == b"grouped_stream")
+        .expect("grouped_stream key missing");
+    assert_eq!(grouped.length, 3);
+    assert_eq!(grouped.last_id, "1772784406065-0");
+    assert_stream_entries_eq(
+        &grouped.entries,
+        &[
+            ("1772784406060-0", &[(b"event", b"login"), (b"user", b"alice")]),
+            (
+                "1772784406062-0",
+                &[
+                    (b"event", b"purchase"),
+                    (b"user", b"bob"),
+                    (b"item", b"widget"),
+                ],
+            ),
+            ("1772784406065-0", &[(b"event", b"logout"), (b"user", b"alice")]),
+        ],
+    );
 }
 
 // --- Listpack-encoded types ---

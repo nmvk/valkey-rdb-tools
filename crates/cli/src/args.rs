@@ -1,8 +1,5 @@
-use std::collections::HashSet;
-
 use clap::{Parser, Subcommand, ValueEnum};
 use parquet::basic::Compression;
-use rdb_to_arrow::Heuristic;
 
 fn parse_positive_usize(s: &str) -> Result<usize, String> {
     let n: usize = s.parse().map_err(|e| format!("{e}"))?;
@@ -30,7 +27,8 @@ fn parse_byte_size(s: &str) -> Result<usize, String> {
     if n == 0 {
         return Err("value must be > 0".to_string());
     }
-    Ok(n * multiplier)
+    n.checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size overflows: {n} * {multiplier}"))
 }
 
 #[derive(Parser)]
@@ -71,11 +69,11 @@ pub struct ExportArgs {
     #[arg(long)]
     pub db: Option<u32>,
 
-    /// Filter by type (comma-separated: string, list, set, zset, hash, geo, hll)
+    /// Filter by type (comma-separated: string, list, set, zset, hash, geo, hll, module, stream)
     #[arg(long = "type")]
     pub type_names: Option<String>,
 
-    /// Filter keys by glob pattern
+    /// Filter keys by glob pattern (non-UTF-8 bytes in keys are replaced with U+FFFD)
     #[arg(long)]
     pub key_pattern: Option<String>,
 
@@ -99,7 +97,7 @@ pub struct ExportArgs {
     #[arg(long, conflicts_with = "max_key_elements")]
     pub no_chunking: bool,
 
-    /// Byte budget per builder batch — flush when exceeded (e.g. 10mb, 50mb)
+    /// Byte budget per builder batch — flush when exceeded [default: 64mb] (e.g. 10mb, 50mb)
     #[arg(long, value_parser = parse_byte_size)]
     pub batch_bytes: Option<usize>,
 
@@ -132,26 +130,6 @@ pub struct ValidateArgs {
     pub output: String,
 }
 
-/// Parse a comma-separated heuristic string into a set.
-///
-/// Accepts "all" (every built-in heuristic), "none" (empty set), "geo",
-/// or comma-separated combinations.
-pub fn parse_heuristics(s: &str) -> Result<HashSet<Heuristic>, Box<dyn std::error::Error>> {
-    if s.eq_ignore_ascii_case("all") {
-        return Ok(Heuristic::ALL.iter().copied().collect());
-    }
-    if s.eq_ignore_ascii_case("none") {
-        return Ok(HashSet::new());
-    }
-    let mut set = HashSet::new();
-    for name in s.split(',') {
-        let name = name.trim();
-        set.insert(Heuristic::from_name(name).ok_or_else(|| {
-            format!("unknown heuristic '{name}'. Valid: all, geo, none")
-        })?);
-    }
-    Ok(set)
-}
 
 #[derive(Clone, ValueEnum)]
 pub enum FormatArg {
@@ -167,19 +145,34 @@ pub enum CompressionArg {
     Zstd,
     Snappy,
     Lz4,
+    #[value(name = "lz4-raw")]
+    Lz4Raw,
     Gzip,
     None,
 }
 
 impl CompressionArg {
-    pub fn to_parquet_compression(&self) -> Compression {
+    /// Canonical lowercase name — matches the accepted input of
+    /// [`rdb_to_arrow::parse_compression`]. The `ValueEnum` derive
+    /// handles parsing from the CLI flag; `as_name` is the reverse
+    /// mapping used to dispatch to the shared parser so the codec table
+    /// lives in exactly one place.
+    fn as_name(&self) -> &'static str {
         match self {
-            CompressionArg::Zstd => Compression::ZSTD(Default::default()),
-            CompressionArg::Snappy => Compression::SNAPPY,
-            CompressionArg::Lz4 => Compression::LZ4,
-            CompressionArg::Gzip => Compression::GZIP(Default::default()),
-            CompressionArg::None => Compression::UNCOMPRESSED,
+            CompressionArg::Zstd => "zstd",
+            CompressionArg::Snappy => "snappy",
+            CompressionArg::Lz4 => "lz4",
+            CompressionArg::Lz4Raw => "lz4-raw",
+            CompressionArg::Gzip => "gzip",
+            CompressionArg::None => "none",
         }
+    }
+
+    pub fn to_parquet_compression(&self) -> Compression {
+        // `parse_compression` can't fail here because `as_name` only
+        // emits values the parser accepts.
+        rdb_to_arrow::parse_compression(self.as_name())
+            .expect("CompressionArg::as_name emits only canonical names")
     }
 }
 

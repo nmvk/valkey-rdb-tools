@@ -1,42 +1,37 @@
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use rdb_parser::RdbReader;
 use std::collections::HashSet;
 
 use rdb_to_arrow::{
     metadata_from_rdb, write_arrow_ipc, write_csv, write_json, write_parquet, ArrowBatcher,
-    ArrowConvertError, BatcherConfig, ParquetConfig, TypeTag,
+    ArrowConvertError, BatcherConfig, Heuristic, ParquetConfig, TypeTag,
 };
-use crate::args::parse_heuristics;
 
 use crate::args::{ExportArgs, FormatArg};
+use crate::cli_error::CliError;
 use crate::filter::{EntryFilter, FilteredEntries};
+use crate::io::{build_rdb_reader, shard_suffix};
 
-pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(args: &ExportArgs) -> Result<(), CliError> {
+    // Validate arguments before any I/O
     let type_tags: Option<HashSet<TypeTag>> = match &args.type_names {
-        Some(names) => {
-            let mut tags = HashSet::new();
-            for name in names.split(',') {
-                let name = name.trim();
-                tags.insert(TypeTag::from_cli_name(name).ok_or_else(|| {
-                    format!("unknown type '{name}'. Valid: string, list, set, zset, hash, geo, hll")
-                })?);
-            }
-            Some(tags)
-        }
+        Some(names) => Some(TypeTag::parse_set(names)?),
         None => None,
     };
+    if let Some(ref s) = args.shard_id {
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err("shard-id must be non-empty and contain only [A-Za-z0-9_-]".into());
+        }
+    }
 
-    // Open input: file or stdin. RdbReader buffers internally.
-    let input: Box<dyn Read> = if args.file == "-" {
-        Box::new(io::stdin())
-    } else {
-        Box::new(File::open(&args.file)?)
-    };
+    // Open input — `build_rdb_reader` handles both "-" (stdin) and
+    // regular files, wrapping I/O errors with the filename and keeping
+    // the IO/Corrupt split for exit codes.
+    let heuristics = Heuristic::parse_set(&args.heuristic)?;
 
-    let reader = RdbReader::new(input)?;
+    let reader = build_rdb_reader(&args.file)?;
     let reader = if args.no_chunking {
         reader.without_chunking()
     } else if let Some(max) = args.max_key_elements {
@@ -44,7 +39,7 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         reader // uses DEFAULT_MAX_KEY_ELEMENTS
     };
-    let mut metadata = metadata_from_rdb(reader.metadata());
+    let metadata = metadata_from_rdb(reader.metadata(), &heuristics);
 
     // Determine output directory
     let output_dir = match &args.output {
@@ -55,27 +50,37 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let stem = Path::new(&args.file)
                     .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                PathBuf::from(stem.as_ref())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "rdb_export".to_string());
+                PathBuf::from(stem)
             }
         }
     };
     fs::create_dir_all(&output_dir)?;
 
+    // Warn if output directory already contains parquet/arrow/csv/json files
+    if let Ok(entries) = fs::read_dir(&output_dir) {
+        let existing: Vec<_> = entries
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.ends_with(".parquet") || s.ends_with(".arrow")
+                    || s.ends_with(".csv") || s.ends_with(".json")
+            })
+            .collect();
+        if !existing.is_empty() {
+            eprintln!(
+                "Warning: output directory '{}' contains {} existing file(s) that will be overwritten",
+                output_dir.display(),
+                existing.len()
+            );
+        }
+    }
+
     // Clone before moving into the filter — we need it again for batch-level output filtering.
     let output_tags = type_tags.clone();
-    let heuristics = parse_heuristics(&args.heuristic)?;
-
-    // Record active heuristics in Parquet metadata so validate can be self-describing.
-    let heuristic_str: String = if heuristics.is_empty() {
-        "none".to_string()
-    } else {
-        let mut names: Vec<&str> = heuristics.iter().map(|h| h.as_str()).collect();
-        names.sort();
-        names.join(",")
-    };
-    metadata.insert("rdb.heuristics".to_string(), heuristic_str);
 
     let filter = EntryFilter {
         db: args.db,
@@ -85,14 +90,18 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let filtered = FilteredEntries::new(reader, filter);
-    #[allow(clippy::needless_update)] // forward-compat guard for new BatcherConfig fields
-    let batcher = ArrowBatcher::new(BatcherConfig {
-        batch_size: args.batch_size,
-        batch_bytes: args.batch_bytes,
-        max_entry_bytes: args.max_entry_bytes,
-        heuristics: heuristics.clone(),
-        ..Default::default()
-    });
+    #[allow(clippy::field_reassign_with_default)] // conditional batch_bytes override
+    let batcher_config = {
+        let mut c = BatcherConfig::default();
+        c.batch_size = args.batch_size;
+        if let Some(bb) = args.batch_bytes {
+            c.batch_bytes = Some(bb);
+        }
+        c.max_entry_bytes = args.max_entry_bytes;
+        c.heuristics = heuristics.clone();
+        c
+    };
+    let batcher = ArrowBatcher::new(batcher_config);
     let raw_batches = batcher.process(filtered);
 
     // The batcher emits additive output (e.g., both zset and geo for geo-like entries).
@@ -114,17 +123,7 @@ pub fn run(args: &ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
         FormatArg::Json => "json",
     };
 
-    if let Some(ref s) = args.shard_id {
-        if s.contains('/') || s.contains('\\') || s.contains("..") {
-            return Err("shard-id must not contain path separators or '..'".into());
-        }
-    }
-
-    let shard_suffix = args
-        .shard_id
-        .as_deref()
-        .map(|s| format!(".{s}"))
-        .unwrap_or_default();
+    let shard_suffix = shard_suffix(args.shard_id.as_deref());
 
     let writer_factory = |tag: TypeTag| -> Result<File, ArrowConvertError> {
         let filename = format!("{}{}.{}", tag.as_str(), shard_suffix, ext);

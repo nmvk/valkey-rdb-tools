@@ -90,6 +90,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, RdbError> {
             _ => unreachable!(), // encoding validated above
         };
         members.push(val.to_string().into_bytes());
+        // Defensive: overflow is unreachable because expected_size is already
+        // validated, but checked_add is cheap and guards against logic bugs.
         pos = pos.checked_add(elem_size).ok_or_else(|| {
             RdbError::CorruptData("intset position overflow".into())
         })?;

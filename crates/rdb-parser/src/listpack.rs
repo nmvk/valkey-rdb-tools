@@ -9,13 +9,34 @@
 // Each entry:
 //   [encoding byte(s)] [data bytes...] [backlen (1-5 bytes)]
 
-use crate::compact::{sign_extend, CompactEntry};
+use crate::compact::{self, sign_extend, CompactEntry};
 use crate::types::RdbError;
+
+fn checked_add(a: usize, b: usize, ctx: &str) -> Result<usize, RdbError> {
+    compact::checked_add(a, b, "listpack", ctx)
+}
+
+fn ensure_len(buf: &[u8], need: usize, ctx: &str) -> Result<(), RdbError> {
+    compact::ensure_len(buf, need, "listpack", ctx)
+}
 
 const LP_HDR_SIZE: usize = 6;
 const LP_EOF: u8 = 0xFF;
 
 /// Decode all entries from a listpack blob.
+///
+/// Validates three structural invariants that a crafted blob could
+/// otherwise exploit to smuggle trailing data past the decoder:
+///
+/// 1. The `total_bytes` header field (first 4 bytes, LE) equals
+///    `data.len()`. A mismatch means either the caller passed the wrong
+///    slice length or the blob has been tampered.
+/// 2. `LP_EOF` appears at the end of the blob, not earlier — an early
+///    EOF followed by extra bytes would silently drop records. For
+///    stream listpacks this would also bypass the trailing-entry check
+///    in `stream::decode_stream_listpack`, because the hidden bytes
+///    never become `CompactEntry` values.
+/// 3. EOF is the *final* byte (`pos == data.len() - 1`).
 pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
     if data.len() < LP_HDR_SIZE + 1 {
         return Err(RdbError::CorruptData(
@@ -23,17 +44,21 @@ pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
         ));
     }
 
-    // Read num_elements from header for pre-allocation hint.
-    // 0xFFFF means "unknown, must scan".
+    // Total-bytes header: the first four LE bytes must equal the full
+    // blob length. Valkey's lpNew/lpInsert keep this invariant when
+    // writing, so any mismatch is a tamper signal.
+    let total_bytes = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if total_bytes != data.len() {
+        return Err(RdbError::CorruptData(format!(
+            "listpack total_bytes header ({total_bytes}) does not match blob length ({})",
+            data.len()
+        )));
+    }
+
+    // Pre-allocation hint from the `num_elements` header field.
+    // `0xFFFF` means "unknown, must scan"; see `compact::capacity_hint`.
     let num_elements = u16::from_le_bytes([data[4], data[5]]);
-    let capacity = if num_elements == 0xFFFF {
-        256 // reasonable default when count is unknown
-    } else {
-        // Cap to blob size — each entry is at least 1 byte, so num_elements
-        // cannot legitimately exceed data.len(). Prevents a crafted header
-        // from causing a huge allocation before parsing begins.
-        (num_elements as usize).min(data.len())
-    };
+    let capacity = compact::capacity_hint(num_elements, data.len());
 
     let mut pos = LP_HDR_SIZE;
     let mut entries = Vec::with_capacity(capacity);
@@ -45,6 +70,17 @@ pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
 
         let enc = data[pos];
         if enc == LP_EOF {
+            // EOF must be the very last byte. A crafted blob that drops
+            // EOF in the middle with extra trailing records would
+            // otherwise be accepted, truncating the decoded entry list
+            // without any corruption signal.
+            if pos != data.len() - 1 {
+                return Err(RdbError::CorruptData(format!(
+                    "listpack EOF at byte {pos} but blob length is {}, expected EOF at {}",
+                    data.len(),
+                    data.len() - 1
+                )));
+            }
             break;
         }
 
@@ -141,9 +177,7 @@ fn decode_entry(buf: &[u8]) -> Result<(CompactEntry, usize), RdbError> {
         // 24-bit signed integer: 0xF2 + 3 bytes LE
         0xF2 => {
             ensure_len(buf, 4, "24-bit int")?;
-            let raw = (buf[1] as u32) | ((buf[2] as u32) << 8) | ((buf[3] as u32) << 16);
-            let val = sign_extend(raw as u64, 24);
-            Ok((CompactEntry::Int(val), 4))
+            Ok((CompactEntry::Int(compact::read_i24_le(buf, 1)), 4))
         }
 
         // 32-bit signed integer: 0xF3 + 4 bytes LE
@@ -170,6 +204,11 @@ fn decode_entry(buf: &[u8]) -> Result<(CompactEntry, usize), RdbError> {
 }
 
 /// How many bytes does the backlen occupy for an entry of `entry_len` bytes?
+/// Compute the number of backlen bytes for a given entry length.
+///
+/// Bug-for-bug compatible with Valkey's `lpEncodeBacklen`: the boundary
+/// at 16383 uses `<` not `<=`, so entry_len == 16383 gets 3 bytes instead
+/// of the expected 2. This matches the server's encoding.
 fn backlen_size(entry_len: usize) -> usize {
     if entry_len <= 127 {
         1
@@ -208,24 +247,6 @@ fn decode_backlen(buf: &[u8]) -> Result<usize, RdbError> {
     usize::try_from(val).map_err(|_| {
         RdbError::CorruptData(format!("listpack backlen {} exceeds usize", val))
     })
-}
-
-fn checked_add(a: usize, b: usize, ctx: &str) -> Result<usize, RdbError> {
-    a.checked_add(b).ok_or_else(|| {
-        RdbError::CorruptData(format!("listpack {}: length overflow", ctx))
-    })
-}
-
-fn ensure_len(buf: &[u8], need: usize, ctx: &str) -> Result<(), RdbError> {
-    if buf.len() < need {
-        return Err(RdbError::CorruptData(format!(
-            "listpack {}: need {} bytes, have {}",
-            ctx,
-            need,
-            buf.len()
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -489,5 +510,82 @@ mod tests {
         let total = LP_HDR_SIZE as u32;
         data[0..4].copy_from_slice(&total.to_le_bytes());
         assert!(decode(&data).is_err());
+    }
+
+    #[test]
+    fn backlen_size_boundaries() {
+        // Pin the width boundaries of `lpEncodeBacklen` per Valkey's wire
+        // format. Any change here breaks compatibility with every existing
+        // RDB file — the comparisons must stay `<` at 16383 and 2097151
+        // to match the server's bug-for-bug encoding.
+        let cases: &[(usize, usize)] = &[
+            (0, 1),
+            (1, 1),
+            (127, 1),           // upper bound of 1-byte backlen
+            (128, 2),           // first value requiring 2 bytes
+            (16382, 2),         // still within 2-byte range
+            (16383, 3),         // bug-for-bug: `<` not `<=` so this is 3, not 2
+            (16384, 3),
+            (2097150, 3),       // upper bound of 3-byte backlen
+            (2097151, 4),       // first value requiring 4 bytes
+            (2097152, 4),
+            (268435454, 4),     // upper bound of 4-byte backlen
+            (268435455, 5),     // first value requiring 5 bytes
+            (usize::MAX, 5),
+        ];
+        for &(entry_len, expected) in cases {
+            assert_eq!(
+                backlen_size(entry_len),
+                expected,
+                "backlen_size({entry_len}) should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_total_bytes_mismatch() {
+        // Build a valid single-int listpack and then corrupt total_bytes
+        // so it disagrees with the actual blob length. The decoder must
+        // reject it rather than silently parsing the first N entries.
+        let mut data = make_listpack(&entry_7bit(42), 1);
+        data[0] = data[0].wrapping_add(1); // bump total_bytes by 1
+        let err = decode(&data).unwrap_err();
+        assert!(matches!(err, RdbError::CorruptData(ref m) if m.contains("total_bytes")));
+    }
+
+    #[test]
+    fn test_rejects_early_eof_with_trailing_bytes() {
+        // Craft a blob whose EOF appears before the stated blob end —
+        // hidden payload past EOF would otherwise be silently dropped
+        // by the decoder and, for stream listpacks, bypass the
+        // trailing-entry check that lives downstream.
+        let entries = entry_7bit(1);
+        let mut data = Vec::new();
+        // total_bytes covers header + entries + EOF + one trailing byte.
+        let total = (LP_HDR_SIZE + entries.len() + 1 + 1) as u32;
+        data.extend_from_slice(&total.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes()); // num_elements
+        data.extend_from_slice(&entries);
+        data.push(LP_EOF); // early EOF — not at the final byte
+        data.push(0x00); // trailing byte past EOF
+        assert_eq!(data.len(), total as usize);
+        let err = decode(&data).unwrap_err();
+        assert!(matches!(err, RdbError::CorruptData(ref m) if m.contains("EOF")));
+    }
+
+    #[test]
+    fn decode_backlen_known_bit_patterns() {
+        // decode_backlen reads `buf.iter().rev()` and OR-accumulates the low
+        // 7 bits of each byte. These cases pin the wire format at the
+        // boundaries the encoder produces.
+        // 127 → single byte 0x7F.
+        assert_eq!(decode_backlen(&[0x7F]).unwrap(), 127);
+        // 128 → two bytes. High-order byte has bit 7 set (continuation),
+        // first byte (forward / MSB) has bit 7 clear (terminator).
+        // value = 128 = 0b1000_0000: low 7 bits = 0, next 1 bit = 1.
+        assert_eq!(decode_backlen(&[0x01, 0x80]).unwrap(), 128);
+        // 16384 → three bytes. 16384 = 0b100_0000000000000.
+        // low 7 bits = 0, next 7 bits = 0, top bit = 1.
+        assert_eq!(decode_backlen(&[0x01, 0x80, 0x80]).unwrap(), 16384);
     }
 }

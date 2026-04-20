@@ -1,4 +1,14 @@
-// RDB file opcodes and type constants — mirrors valkey/src/rdb.h
+//! RDB file opcodes and type constants.
+//!
+//! These mirror the byte values defined in
+//! [`valkey/src/rdb.h`](https://github.com/valkey-io/valkey/blob/unstable/src/rdb.h).
+//! Each constant is named identically to its C counterpart, so the
+//! canonical documentation is the Valkey header; we do not duplicate
+//! those docs here.
+
+// Individual opcode/type constants get their names directly from the
+// Valkey RDB spec and don't need per-item docstrings.
+#![allow(missing_docs)]
 
 // --- Opcodes ---
 
@@ -141,21 +151,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_object_type_accepts_all_known_types() {
-        for &t in &ALL_TYPE_CODES {
-            assert!(
-                is_object_type(t),
-                "is_object_type should accept type code {}",
-                t
-            );
-        }
-    }
-
-    #[test]
     fn test_is_object_type_rejects_non_types() {
-        // Type 8 is explicitly unused
+        // Type 8 is explicitly unused in the Valkey RDB format.
         assert!(!is_object_type(8));
-        // Opcodes should not be accepted
+        // Opcodes (metadata framing) must not be classified as object types.
         for &op in &[
             RDB_OPCODE_AUX,
             RDB_OPCODE_SELECTDB,
@@ -169,32 +168,53 @@ mod tests {
         ] {
             assert!(
                 !is_object_type(op),
-                "is_object_type should reject opcode {}",
-                op
+                "is_object_type should reject opcode {op}"
             );
         }
     }
 
+    /// Pins the expected (type_name, encoding_name) strings for every known
+    /// RDB type code. Adding a new type code to `ALL_TYPE_CODES` without
+    /// updating this table will fail the test — preventing silent `"unknown"`
+    /// fallthroughs in either function.
     #[test]
-    fn test_type_name_covers_all_known_types() {
-        for &t in &ALL_TYPE_CODES {
-            assert_ne!(
-                type_name(t),
-                "unknown",
-                "type_name missing coverage for type code {}",
-                t
-            );
-        }
-    }
-
-    #[test]
-    fn test_encoding_name_covers_all_known_types() {
-        for &t in &ALL_TYPE_CODES {
-            assert_ne!(
-                encoding_name(t),
-                "unknown",
-                "encoding_name missing coverage for type code {}",
-                t
+    fn type_code_metadata_table() {
+        let cases: &[(u8, &str, &str)] = &[
+            (RDB_TYPE_STRING, "string", "string"),
+            (RDB_TYPE_LIST, "list", "linkedlist"),
+            (RDB_TYPE_SET, "set", "hashtable"),
+            (RDB_TYPE_ZSET, "zset", "skiplist"),
+            (RDB_TYPE_HASH, "hash", "hashtable"),
+            (RDB_TYPE_ZSET_2, "zset", "skiplist"),
+            (RDB_TYPE_MODULE_PRE_GA, "module", "module"),
+            (RDB_TYPE_MODULE_2, "module", "module"),
+            (RDB_TYPE_HASH_ZIPMAP, "hash", "zipmap"),
+            (RDB_TYPE_LIST_ZIPLIST, "list", "ziplist"),
+            (RDB_TYPE_SET_INTSET, "set", "intset"),
+            (RDB_TYPE_ZSET_ZIPLIST, "zset", "ziplist"),
+            (RDB_TYPE_HASH_ZIPLIST, "hash", "ziplist"),
+            (RDB_TYPE_LIST_QUICKLIST, "list", "quicklist"),
+            (RDB_TYPE_STREAM_LISTPACKS, "stream", "stream"),
+            (RDB_TYPE_HASH_LISTPACK, "hash", "listpack"),
+            (RDB_TYPE_ZSET_LISTPACK, "zset", "listpack"),
+            (RDB_TYPE_LIST_QUICKLIST_2, "list", "quicklist2"),
+            (RDB_TYPE_STREAM_LISTPACKS_2, "stream", "stream2"),
+            (RDB_TYPE_SET_LISTPACK, "set", "listpack"),
+            (RDB_TYPE_STREAM_LISTPACKS_3, "stream", "stream3"),
+            (RDB_TYPE_HASH_2, "hash", "hashtable"),
+        ];
+        assert_eq!(
+            cases.len(),
+            ALL_TYPE_CODES.len(),
+            "table must cover every code in ALL_TYPE_CODES"
+        );
+        for &(code, expected_type, expected_encoding) in cases {
+            assert!(is_object_type(code), "is_object_type({code})");
+            assert_eq!(type_name(code), expected_type, "type_name({code})");
+            assert_eq!(
+                encoding_name(code),
+                expected_encoding,
+                "encoding_name({code})"
             );
         }
     }

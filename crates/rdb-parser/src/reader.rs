@@ -7,6 +7,7 @@ use std::io::{BufReader, Read};
 use crate::crc64;
 use crate::opcodes::*;
 use crate::types::*;
+use crate::CAPACITY_HINT_MAX;
 
 // Module serialized value sub-opcodes (from rdb.h)
 const RDB_MODULE_OPCODE_EOF: u64 = 0;
@@ -15,6 +16,27 @@ const RDB_MODULE_OPCODE_UINT: u64 = 2;
 const RDB_MODULE_OPCODE_FLOAT: u64 = 3;
 const RDB_MODULE_OPCODE_DOUBLE: u64 = 4;
 const RDB_MODULE_OPCODE_STRING: u64 = 5;
+
+/// Module type name character set (base-64 alphabet from Valkey's module.c).
+const MODULE_TYPE_NAME_CHARSET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Decode a 64-bit module type ID into (name, encoding_version).
+///
+/// The module ID packs a 9-character name in the upper 54 bits (6 bits per
+/// character, using a base-64 alphabet) and a 10-bit encoding version in the
+/// lower 10 bits. Ported from `moduleTypeNameByID` in Valkey `module.c`.
+fn decode_module_id(module_id: u64) -> (String, u32) {
+    let mut name = [0u8; 9];
+    let version = (module_id & 0x3FF) as u32; // lower 10 bits
+    let mut id = module_id >> 10;
+    for i in (0..9).rev() {
+        name[i] = MODULE_TYPE_NAME_CHARSET[(id & 0x3F) as usize];
+        id >>= 6;
+    }
+    // Module names are always exactly 9 characters
+    (String::from_utf8_lossy(&name).into_owned(), version)
+}
 
 // REDIS magic: native versions 1-11, foreign 12-79 (rejected in strict mode)
 const RDB_VERSION_MAX_REDIS_NATIVE: u32 = 11;
@@ -101,6 +123,8 @@ pub struct RdbReader<R: Read> {
     max_key_elements: Option<usize>,
     /// Active chunk-reading state for a large key being split across entries.
     chunked: Option<ChunkedState>,
+    /// Set to true when the CRC-64 checksum was actually validated at EOF.
+    crc_checked: bool,
 }
 
 impl<R: Read> RdbReader<R> {
@@ -121,6 +145,7 @@ impl<R: Read> RdbReader<R> {
             preamble_byte: None,
             finished: false,
             max_key_elements: Some(DEFAULT_MAX_KEY_ELEMENTS),
+            crc_checked: false,
             chunked: None,
         };
         rdr.read_preamble()?;
@@ -137,6 +162,13 @@ impl<R: Read> RdbReader<R> {
         &self.metadata
     }
 
+    /// Returns true if the CRC-64 checksum was validated at EOF.
+    /// False before iteration completes, for RDB version < 5, or when
+    /// the stored checksum was zero (checksumming disabled at save time).
+    pub fn crc_checked(&self) -> bool {
+        self.crc_checked
+    }
+
     /// Set the maximum number of elements per chunk for large plain-encoded
     /// collections. When a key has more elements than this limit, it will be
     /// yielded as multiple `RdbEntry` values with `total_elements` and
@@ -148,6 +180,7 @@ impl<R: Read> RdbReader<R> {
     /// # Panics
     ///
     /// Panics if `max` is 0 (would cause an infinite loop).
+    #[must_use]
     pub fn with_max_key_elements(mut self, max: usize) -> Self {
         assert!(max > 0, "max_key_elements must be > 0");
         self.max_key_elements = Some(max);
@@ -156,6 +189,7 @@ impl<R: Read> RdbReader<R> {
 
     /// Disable chunking entirely. All collections will be read into a single
     /// `RdbEntry` regardless of size.
+    #[must_use]
     pub fn without_chunking(mut self) -> Self {
         self.max_key_elements = None;
         self
@@ -294,7 +328,7 @@ impl<R: Read> RdbReader<R> {
                         "LZF uncompressed length",
                     )?;
                     let compressed = self.read_exact_vec(compressed_len)?;
-                    let decompressed = lzf_decompress(&compressed, uncompressed_len)?;
+                    let decompressed = crate::lzf::decompress(&compressed, uncompressed_len)?;
                     Ok(decompressed)
                 }
                 _ => Err(RdbError::CorruptData(format!(
@@ -326,26 +360,61 @@ impl<R: Read> RdbReader<R> {
         }
     }
 
-    /// Skip a module value by consuming its opcode stream until EOF marker.
-    /// Reference: rdbLoadCheckModuleValue() in valkey/src/rdb.c
-    fn skip_module_data(&mut self) -> Result<(), RdbError> {
+    /// Maximum number of sub-values a single module payload may decode
+    /// before the parser rejects it. A crafted module could otherwise
+    /// emit millions of tiny UINT/STRING opcodes and force
+    /// proportional allocation before `max_entry_bytes` or Arrow
+    /// batching ever sees the entry. 5M matches the stream cap.
+    const MAX_MODULE_VALUES: usize = 5_000_000;
+
+    /// Maximum cumulative bytes of variable-length module string values.
+    /// Fixed-width numeric variants don't count. 256 MiB is comfortably
+    /// above realistic module payloads (document stores, time-series
+    /// samples, large blobs) while still preventing a compressed-stream
+    /// expansion from running away.
+    const MAX_MODULE_STRING_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Consume a module's opcode stream, calling `emit` for each decoded value.
+    ///
+    /// Single dispatch point for all module sub-opcodes — both
+    /// [`read_module_data`](Self::read_module_data) and
+    /// [`skip_module_data`](Self::skip_module_data) delegate here to
+    /// avoid drift. The emit callback may return `Err` to short-circuit
+    /// the loop (used by `read_module_data` to enforce value and byte
+    /// caps on adversarial input).
+    ///
+    /// Reference: `rdbLoadCheckModuleValue()` in valkey/src/rdb.c.
+    fn for_each_module_value(
+        &mut self,
+        mut emit: impl FnMut(ModuleValue) -> Result<(), RdbError>,
+    ) -> Result<(), RdbError> {
         loop {
             let opcode = self.read_length_value()?;
             if opcode == RDB_MODULE_OPCODE_EOF {
                 return Ok(());
             }
             match opcode {
-                RDB_MODULE_OPCODE_SINT | RDB_MODULE_OPCODE_UINT => {
-                    let _val = self.read_length_value()?;
+                RDB_MODULE_OPCODE_SINT => {
+                    let raw = self.read_length_value()?;
+                    emit(ModuleValue::SignedInt(raw as i64))?;
+                }
+                RDB_MODULE_OPCODE_UINT => {
+                    let raw = self.read_length_value()?;
+                    emit(ModuleValue::UnsignedInt(raw))?;
                 }
                 RDB_MODULE_OPCODE_STRING => {
-                    let _s = self.read_string()?;
+                    let s = self.read_string()?;
+                    emit(ModuleValue::String(s))?;
                 }
                 RDB_MODULE_OPCODE_FLOAT => {
-                    let _f = self.read_exact_vec(4)?;
+                    let mut buf = [0u8; 4];
+                    self.reader.read_exact(&mut buf)?;
+                    emit(ModuleValue::Float(f32::from_le_bytes(buf)))?;
                 }
                 RDB_MODULE_OPCODE_DOUBLE => {
-                    let _d = self.read_exact_vec(8)?;
+                    let mut buf = [0u8; 8];
+                    self.reader.read_exact(&mut buf)?;
+                    emit(ModuleValue::Double(f64::from_le_bytes(buf)))?;
                 }
                 _ => {
                     return Err(RdbError::CorruptData(format!(
@@ -357,14 +426,54 @@ impl<R: Read> RdbReader<R> {
         }
     }
 
+    /// Read a module's opcode stream, collecting all values, with caps on
+    /// both value count and accumulated string bytes to prevent an
+    /// adversarial module payload from driving unbounded allocation.
+    fn read_module_data(&mut self) -> Result<Vec<ModuleValue>, RdbError> {
+        let mut values: Vec<ModuleValue> = Vec::new();
+        let mut string_bytes: usize = 0;
+        self.for_each_module_value(|v| {
+            if values.len() >= Self::MAX_MODULE_VALUES {
+                return Err(RdbError::CorruptData(format!(
+                    "module value count exceeds {} limit",
+                    Self::MAX_MODULE_VALUES
+                )));
+            }
+            if let ModuleValue::String(ref s) = v {
+                string_bytes = string_bytes.saturating_add(s.len());
+                if string_bytes > Self::MAX_MODULE_STRING_BYTES {
+                    return Err(RdbError::CorruptData(format!(
+                        "module string bytes exceed {} limit",
+                        Self::MAX_MODULE_STRING_BYTES
+                    )));
+                }
+            }
+            values.push(v);
+            Ok(())
+        })?;
+        Ok(values)
+    }
+
+    /// Skip a module's opcode stream, discarding values without allocation.
+    /// Used for MODULE_AUX data which is always discarded.
+    fn skip_module_data(&mut self) -> Result<(), RdbError> {
+        self.for_each_module_value(|_| Ok(()))
+    }
+
     /// Eagerly consume AUX fields that precede the first database section.
     /// Stores the first non-AUX byte in `preamble_byte` for replay.
     /// Read one AUX field (key + value strings) and insert into metadata.
     fn read_aux_field(&mut self) -> Result<(), RdbError> {
         let key = self.read_string()?;
         let value = self.read_string()?;
-        let key_str = String::from_utf8(key)
-            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        // AUX keys must be valid UTF-8 (they're server-defined ASCII names
+        // like "redis-ver", "ctime", etc.). Reject non-UTF-8 to avoid
+        // lossy conversion collisions in the metadata map.
+        let key_str = String::from_utf8(key).map_err(|_| {
+            RdbError::CorruptData("AUX key is not valid UTF-8".into())
+        })?;
+        // AUX values are typically ASCII but could contain arbitrary bytes
+        // in future extensions. Use lossy conversion for values only.
         let val_str = String::from_utf8(value)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         self.metadata.aux.insert(key_str, val_str);
@@ -393,12 +502,15 @@ impl<R: Read> RdbReader<R> {
 
         let key = self.read_string()?;
 
-        // Check if this is a chunkable plain type that exceeds the threshold
+        // Check if this is a chunkable plain type that exceeds the threshold.
+        // Both branches below return early — the fallthrough to read_value() at
+        // the end of this function is only reached when chunking is disabled or
+        // the type is not a plain type (compact encoding, string, stream, module).
         if let Some(max) = self.max_key_elements {
             if is_plain_type(type_code) {
                 let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
                 if count > max {
-                    let chunk_size = max.min(count);
+                    let chunk_size = max; // count > max is guaranteed here
                     let value = self.read_n_elements(type_code, chunk_size)?;
                     let remaining = count - chunk_size;
                     if remaining > 0 {
@@ -459,7 +571,7 @@ impl<R: Read> RdbReader<R> {
 
     /// Read the value for a given type code.
     /// All standard types are decoded except HASH_ZIPMAP (type 9), streams
-    /// (types 15, 19, 21), and modules (types 6, 7) which return UnknownType.
+    /// (types 15, 19, 21) which return UnknownType. Modules (type 7) are fully parsed.
     fn read_value(&mut self, type_code: u8) -> Result<RdbValue, RdbError> {
         match type_code {
             RDB_TYPE_STRING => {
@@ -520,84 +632,11 @@ impl<R: Read> RdbReader<R> {
                 Err(RdbError::UnknownType(type_code))
             }
 
-            // --- Hashtable-encoded hash: N field-value string pairs ---
-            RDB_TYPE_HASH => {
+            // --- Plain collection types: read count, delegate to read_n_elements ---
+            RDB_TYPE_HASH | RDB_TYPE_HASH_2 | RDB_TYPE_LIST | RDB_TYPE_SET
+            | RDB_TYPE_ZSET | RDB_TYPE_ZSET_2 => {
                 let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
-                let mut fields = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let field = self.read_string()?;
-                    let value = self.read_string()?;
-                    fields.push(HashField {
-                        field,
-                        value,
-                        expiry_ms: None,
-                    });
-                }
-                Ok(RdbValue::Hash(fields))
-            }
-
-            // --- HASH_2: N (field, value, expiry_ms) triples (Valkey 9.0) ---
-            RDB_TYPE_HASH_2 => {
-                let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
-                let mut fields = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let field = self.read_string()?;
-                    let value = self.read_string()?;
-                    let ttl = self.read_i64_le()?;
-                    fields.push(HashField {
-                        field,
-                        value,
-                        expiry_ms: if ttl == -1 { None } else { Some(ttl) },
-                    });
-                }
-                Ok(RdbValue::Hash(fields))
-            }
-
-            // --- Plain list: N string elements ---
-            RDB_TYPE_LIST => {
-                let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
-                let mut elements = Vec::with_capacity(count);
-                for _ in 0..count {
-                    elements.push(self.read_string()?);
-                }
-                Ok(RdbValue::List(elements))
-            }
-
-            // --- Plain set: N string members ---
-            RDB_TYPE_SET => {
-                let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
-                let mut members = Vec::with_capacity(count);
-                for _ in 0..count {
-                    members.push(self.read_string()?);
-                }
-                Ok(RdbValue::Set(members))
-            }
-
-            // --- Sorted set v1: N (member, rdbLoadDoubleValue score) pairs ---
-            RDB_TYPE_ZSET => {
-                let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
-                let mut pairs = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let member = self.read_string()?;
-                    let score = self.read_double_value()?;
-                    pairs.push((member, score));
-                }
-                Ok(RdbValue::SortedSet(pairs))
-            }
-
-            // --- Sorted set v2: N (member, 8-byte LE binary double) pairs ---
-            RDB_TYPE_ZSET_2 => {
-                let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
-                let mut pairs = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let member = self.read_string()?;
-                    let buf = self.read_exact_vec(8)?;
-                    let score = f64::from_le_bytes(
-                        buf.try_into().expect("read_exact_vec returned 8 bytes"),
-                    );
-                    pairs.push((member, score));
-                }
-                Ok(RdbValue::SortedSet(pairs))
+                self.read_n_elements(type_code, count)
             }
 
             // --- Quicklist v1: N ziplist nodes ---
@@ -647,18 +686,22 @@ impl<R: Read> RdbReader<R> {
                 Ok(RdbValue::List(elements))
             }
 
-            // --- Stream types: skip for now (complex radix tree) ---
+            // --- Stream types: decode listpacks into stream entries ---
             RDB_TYPE_STREAM_LISTPACKS | RDB_TYPE_STREAM_LISTPACKS_2
             | RDB_TYPE_STREAM_LISTPACKS_3 => {
-                self.skip_stream(type_code)?;
-                Err(RdbError::UnknownType(type_code)) // TODO: decode
+                self.read_stream(type_code)
             }
 
-            // --- Module types: skip by consuming the opcode stream ---
+            // --- Module types: parse the opcode stream ---
             RDB_TYPE_MODULE_2 => {
-                let _module_id = self.read_length_value()?;
-                self.skip_module_data()?;
-                Err(RdbError::UnknownType(type_code))
+                let module_id = self.read_length_value()?;
+                let (module_name, module_version) = decode_module_id(module_id);
+                let values = self.read_module_data()?;
+                Ok(RdbValue::Module(ModuleData {
+                    module_name,
+                    module_version,
+                    values,
+                }))
             }
 
             // MODULE_PRE_GA is rejected by Valkey; we reject it too
@@ -678,21 +721,58 @@ impl<R: Read> RdbReader<R> {
         }
     }
 
-    /// Skip a stream value by consuming its bytes without decoding.
-    /// Streams have the most complex RDB format. This reads just enough
-    /// structure to advance the reader past the payload.
-    fn skip_stream(&mut self, type_code: u8) -> Result<(), RdbError> {
-        // All stream versions start with N listpack entries in a radix tree
-        let num_listpacks = Self::len_to_usize(self.read_length_value()?, "stream listpack count")?;
+    /// Read a stream value, decoding each listpack as its bytes arrive so
+    /// only one raw blob is resident at a time.
+    ///
+    /// Consumer group metadata is consumed but not included in the output
+    /// (it is operational state, not data).
+    ///
+    /// A decode error is captured and deferred until after the entire
+    /// stream payload has been drained — returning early would leave the
+    /// parser misaligned for subsequent keys. I/O-level errors from
+    /// `read_string` / `read_length_value` are still fatal immediately
+    /// since the stream is already unrecoverable at that point.
+    fn read_stream(&mut self, type_code: u8) -> Result<RdbValue, RdbError> {
+        let num_listpacks =
+            Self::len_to_usize(self.read_length_value()?, "stream listpack count")?;
+
+        let mut all_entries: Vec<StreamEntry> = Vec::new();
+        let mut deferred_err: Option<RdbError> = None;
+
         for _ in 0..num_listpacks {
-            let _master_id = self.read_string()?; // radix tree key (stream ID)
-            let _listpack = self.read_string()?; // listpack blob
+            let master_id_bytes = self.read_string()?;
+            let lp_data = self.read_string()?;
+
+            // Once we've captured a decode error, keep consuming I/O to
+            // stay byte-aligned but don't bother decoding further. The
+            // blobs drop at end of scope, so memory stays bounded.
+            if deferred_err.is_some() {
+                continue;
+            }
+
+            if master_id_bytes.len() != 16 {
+                deferred_err = Some(RdbError::CorruptData(format!(
+                    "stream master ID is {} bytes, expected exactly 16",
+                    master_id_bytes.len()
+                )));
+                continue;
+            }
+            let ms = u64::from_be_bytes(master_id_bytes[..8].try_into().unwrap());
+            let seq = u64::from_be_bytes(master_id_bytes[8..16].try_into().unwrap());
+
+            let budget = crate::stream::MAX_STREAM_ENTRIES.saturating_sub(all_entries.len());
+            match crate::stream::decode_stream_listpack(ms, seq, &lp_data, budget) {
+                Ok(entries) => all_entries.extend(entries),
+                Err(e) => deferred_err = Some(e),
+            }
+            // `master_id_bytes` and `lp_data` drop here — next iteration
+            // starts with only `all_entries` and accumulated deferred state.
         }
 
-        // Stream metadata
-        let _length = self.read_length_value()?; // number of entries
-        let _last_id_ms = self.read_length_value()?;
-        let _last_id_seq = self.read_length_value()?;
+        let length = self.read_length_value()?;
+        let last_id_ms = self.read_length_value()?;
+        let last_id_seq = self.read_length_value()?;
+        let last_id = format!("{last_id_ms}-{last_id_seq}");
 
         if type_code >= RDB_TYPE_STREAM_LISTPACKS_2 {
             let _first_id_ms = self.read_length_value()?;
@@ -702,7 +782,35 @@ impl<R: Read> RdbReader<R> {
             let _entries_added = self.read_length_value()?;
         }
 
-        // Consumer groups
+        self.skip_stream_consumer_groups(type_code)?;
+
+        if let Some(e) = deferred_err {
+            return Err(e);
+        }
+
+        // Cross-check the RDB-reported length against the decoded
+        // non-deleted entry count. A mismatch means either the stream
+        // metadata is wrong or a listpack silently under/over-delivered
+        // rows — both corrupt. Without this, a tampered file could
+        // export successfully while `StreamData.length` (and the Arrow
+        // `num_elements` column) claims a different cardinality than
+        // the exported rows.
+        let decoded = all_entries.len() as u64;
+        if length != decoded {
+            return Err(RdbError::CorruptData(format!(
+                "stream length metadata ({length}) does not match decoded entry count ({decoded})"
+            )));
+        }
+
+        Ok(RdbValue::Stream(StreamData {
+            entries: all_entries,
+            length,
+            last_id,
+        }))
+    }
+
+    /// Consume stream consumer group data without decoding.
+    fn skip_stream_consumer_groups(&mut self, type_code: u8) -> Result<(), RdbError> {
         let num_cgroups = Self::len_to_usize(self.read_length_value()?, "stream cgroup count")?;
         for _ in 0..num_cgroups {
             let _name = self.read_string()?;
@@ -713,15 +821,13 @@ impl<R: Read> RdbReader<R> {
                 let _entries_read = self.read_length_value()?;
             }
 
-            // PEL (pending entries list)
             let num_pel = Self::len_to_usize(self.read_length_value()?, "stream PEL count")?;
             for _ in 0..num_pel {
-                let _id = self.read_exact_vec(16)?; // 128-bit stream ID
+                let _id = self.read_exact_vec(16)?;
                 let _delivery_time = self.read_i64_le()?;
                 let _delivery_count = self.read_length_value()?;
             }
 
-            // Consumers
             let num_consumers = Self::len_to_usize(self.read_length_value()?, "stream consumer count")?;
             for _ in 0..num_consumers {
                 let _consumer_name = self.read_string()?;
@@ -731,37 +837,36 @@ impl<R: Read> RdbReader<R> {
                     let _active_time = self.read_i64_le()?;
                 }
 
-                // Consumer's PEL (references into the group PEL)
                 let consumer_pel = Self::len_to_usize(self.read_length_value()?, "stream consumer PEL count")?;
                 for _ in 0..consumer_pel {
-                    let _id = self.read_exact_vec(16)?; // 128-bit stream ID
+                    let _id = self.read_exact_vec(16)?;
                 }
             }
         }
-
         Ok(())
     }
 
     /// Read exactly `n` elements for a plain-encoded type, returning the
     /// appropriate `RdbValue`.
     fn read_n_elements(&mut self, type_code: u8, n: usize) -> Result<RdbValue, RdbError> {
+        let cap = n.min(CAPACITY_HINT_MAX);
         match type_code {
             RDB_TYPE_LIST => {
-                let mut elements = Vec::with_capacity(n);
+                let mut elements = Vec::with_capacity(cap);
                 for _ in 0..n {
                     elements.push(self.read_string()?);
                 }
                 Ok(RdbValue::List(elements))
             }
             RDB_TYPE_SET => {
-                let mut members = Vec::with_capacity(n);
+                let mut members = Vec::with_capacity(cap);
                 for _ in 0..n {
                     members.push(self.read_string()?);
                 }
                 Ok(RdbValue::Set(members))
             }
             RDB_TYPE_ZSET => {
-                let mut pairs = Vec::with_capacity(n);
+                let mut pairs = Vec::with_capacity(cap);
                 for _ in 0..n {
                     let member = self.read_string()?;
                     let score = self.read_double_value()?;
@@ -770,7 +875,7 @@ impl<R: Read> RdbReader<R> {
                 Ok(RdbValue::SortedSet(pairs))
             }
             RDB_TYPE_HASH => {
-                let mut fields = Vec::with_capacity(n);
+                let mut fields = Vec::with_capacity(cap);
                 for _ in 0..n {
                     let field = self.read_string()?;
                     let value = self.read_string()?;
@@ -783,19 +888,18 @@ impl<R: Read> RdbReader<R> {
                 Ok(RdbValue::Hash(fields))
             }
             RDB_TYPE_ZSET_2 => {
-                let mut pairs = Vec::with_capacity(n);
+                let mut pairs = Vec::with_capacity(cap);
                 for _ in 0..n {
                     let member = self.read_string()?;
-                    let buf = self.read_exact_vec(8)?;
-                    let score = f64::from_le_bytes(
-                        buf.try_into().expect("read_exact_vec returned 8 bytes"),
-                    );
+                    let mut score_buf = [0u8; 8];
+                    self.reader.read_exact(&mut score_buf)?;
+                    let score = f64::from_le_bytes(score_buf);
                     pairs.push((member, score));
                 }
                 Ok(RdbValue::SortedSet(pairs))
             }
             RDB_TYPE_HASH_2 => {
-                let mut fields = Vec::with_capacity(n);
+                let mut fields = Vec::with_capacity(cap);
                 for _ in 0..n {
                     let field = self.read_string()?;
                     let value = self.read_string()?;
@@ -837,9 +941,8 @@ impl<R: Read> RdbReader<R> {
 
         let value = self.read_n_elements(type_code, chunk_size)?;
 
-        // Update or clear chunked state
         let state = self.chunked.as_mut().ok_or_else(|| {
-            RdbError::CorruptData("chunked state disappeared during read".into())
+            RdbError::CorruptData("internal: chunked state missing after read_n_elements".into())
         })?;
         state.remaining -= chunk_size;
         state.element_offset += chunk_size as u64;
@@ -937,7 +1040,12 @@ impl<R: Read> RdbReader<R> {
                 RDB_OPCODE_EXPIRETIME => {
                     // rdbLoadTime() reads a signed 32-bit value
                     let secs = self.read_i32_le()?;
-                    self.pending_expiry_ms = Some(secs as i64 * 1000);
+                    let ms = (secs as i64).checked_mul(1000).ok_or_else(|| {
+                        RdbError::CorruptData(format!(
+                            "EXPIRETIME overflow: {secs} seconds"
+                        ))
+                    })?;
+                    self.pending_expiry_ms = Some(ms);
                     continue;
                 }
 
@@ -964,14 +1072,14 @@ impl<R: Read> RdbReader<R> {
 
                     // Validate if version >= 5 and stored checksum is non-zero
                     // (zero means checksumming was disabled at save time)
-                    if self.header.version >= 5
-                        && stored_crc != 0
-                        && computed_crc != stored_crc
-                    {
-                        return Err(RdbError::CorruptData(format!(
-                            "CRC64 mismatch: computed 0x{:016x}, stored 0x{:016x}",
-                            computed_crc, stored_crc
-                        )));
+                    if self.header.version >= 5 && stored_crc != 0 {
+                        if computed_crc != stored_crc {
+                            return Err(RdbError::CorruptData(format!(
+                                "CRC64 mismatch: computed 0x{:016x}, stored 0x{:016x}",
+                                computed_crc, stored_crc
+                            )));
+                        }
+                        self.crc_checked = true;
                     }
 
                     self.finished = true;
@@ -1114,1177 +1222,12 @@ fn read_header(reader: &mut impl Read) -> Result<RdbHeader, RdbError> {
     Ok(RdbHeader { magic, version })
 }
 
-// --- LZF decompression ---
-
-/// Decompress LZF-compressed data.
-///
-/// LZF is a simple byte-level compressor. Format:
-///   - If first byte high bit = 0: literal run (length = byte + 1, copy N bytes)
-///   - If first byte high 3 bits != 0b111: short back-reference
-///     length = (byte >> 5) + 2, offset from high bits + next byte
-///   - If first byte high 3 bits == 0b111: long back-reference
-///     length = next byte + 9, offset from remaining bits + byte after
-fn lzf_decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>, RdbError> {
-    let mut output = Vec::with_capacity(expected_len);
-    let mut i = 0;
-
-    while i < compressed.len() {
-        let ctrl = compressed[i] as usize;
-        i += 1;
-
-        if ctrl < 32 {
-            // Literal run: copy ctrl+1 bytes
-            let len = ctrl + 1;
-            if i + len > compressed.len() {
-                return Err(RdbError::CorruptData("LZF literal overrun".into()));
-            }
-            if output.len() + len > expected_len {
-                return Err(RdbError::CorruptData("LZF output exceeds expected length".into()));
-            }
-            output.extend_from_slice(&compressed[i..i + len]);
-            i += len;
-        } else {
-            // Back-reference
-            let mut len = ctrl >> 5;
-            let mut offset;
-
-            if len == 7 {
-                // Long match: length = next byte + 9
-                if i >= compressed.len() {
-                    return Err(RdbError::CorruptData("LZF long match overrun".into()));
-                }
-                len += compressed[i] as usize;
-                i += 1;
-            }
-            len += 2; // minimum match length is 2 (stored as 0)
-
-            if i >= compressed.len() {
-                return Err(RdbError::CorruptData("LZF offset overrun".into()));
-            }
-            offset = ((ctrl & 0x1F) << 8) | compressed[i] as usize;
-            i += 1;
-            offset += 1; // offset is 1-based
-
-            if offset > output.len() {
-                return Err(RdbError::CorruptData("LZF offset beyond output".into()));
-            }
-            if output.len() + len > expected_len {
-                return Err(RdbError::CorruptData("LZF output exceeds expected length".into()));
-            }
-
-            let start = output.len() - offset;
-            for j in 0..len {
-                let byte = output[start + j];
-                output.push(byte);
-            }
-        }
-    }
-
-    if output.len() != expected_len {
-        return Err(RdbError::CorruptData(format!(
-            "LZF decompressed size mismatch: got {}, expected {}",
-            output.len(),
-            expected_len
-        )));
-    }
-
-    Ok(output)
-}
 
 // =============================================================================
 // Tests
 // =============================================================================
 
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    // --- Header tests ---
-
-    #[test]
-    fn test_redis_magic() {
-        let data = b"REDIS0009xxxxxxxxx";
-        let header = read_header(&mut Cursor::new(&data[..])).unwrap();
-        assert_eq!(header.magic, RdbMagic::Redis);
-        assert_eq!(header.version, 9);
-    }
-
-    #[test]
-    fn test_valkey_magic() {
-        let data = b"VALKEY080xxxxxxxxx";
-        let header = read_header(&mut Cursor::new(&data[..])).unwrap();
-        assert_eq!(header.magic, RdbMagic::Valkey);
-        assert_eq!(header.version, 80);
-    }
-
-    #[test]
-    fn test_redis_version_11() {
-        let data = b"REDIS0011xxxxxxxxx";
-        let header = read_header(&mut Cursor::new(&data[..])).unwrap();
-        assert_eq!(header.magic, RdbMagic::Redis);
-        assert_eq!(header.version, 11);
-    }
-
-    #[test]
-    fn test_invalid_magic() {
-        let data = b"GARBAGE00xxxxxxxxx";
-        assert!(read_header(&mut Cursor::new(&data[..])).is_err());
-    }
-
-    #[test]
-    fn test_too_short() {
-        let data = b"REDIS";
-        assert!(read_header(&mut Cursor::new(&data[..])).is_err());
-    }
-
-    // --- Length encoding tests ---
-
-    #[test]
-    fn test_length_6bit() {
-        // 0b00_001010 = 10
-        let data = [0b00_001010u8];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Len(v) => assert_eq!(v, 10),
-            _ => panic!("expected Len"),
-        }
-    }
-
-    #[test]
-    fn test_length_6bit_zero() {
-        let data = [0b00_000000u8];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Len(v) => assert_eq!(v, 0),
-            _ => panic!("expected Len"),
-        }
-    }
-
-    #[test]
-    fn test_length_6bit_max() {
-        // 0b00_111111 = 63
-        let data = [0b00_111111u8];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Len(v) => assert_eq!(v, 63),
-            _ => panic!("expected Len"),
-        }
-    }
-
-    #[test]
-    fn test_length_14bit() {
-        // 0b01_000001, 0x00 → (1 << 8) | 0 = 256
-        let data = [0b01_000001u8, 0x00];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Len(v) => assert_eq!(v, 256),
-            _ => panic!("expected Len"),
-        }
-    }
-
-    #[test]
-    fn test_length_14bit_max() {
-        // 0b01_111111, 0xFF → (63 << 8) | 255 = 16383
-        let data = [0b01_111111u8, 0xFF];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Len(v) => assert_eq!(v, 16383),
-            _ => panic!("expected Len"),
-        }
-    }
-
-    #[test]
-    fn test_length_32bit() {
-        // 0x80 followed by 4 bytes big-endian: 0x00, 0x01, 0x00, 0x00 = 65536
-        let data = [0x80u8, 0x00, 0x01, 0x00, 0x00];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Len(v) => assert_eq!(v, 65536),
-            _ => panic!("expected Len"),
-        }
-    }
-
-    #[test]
-    fn test_length_64bit() {
-        // 0x81 followed by 8 bytes big-endian: 1
-        let data = [0x81u8, 0, 0, 0, 0, 0, 0, 0, 1];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Len(v) => assert_eq!(v, 1),
-            _ => panic!("expected Len"),
-        }
-    }
-
-    #[test]
-    fn test_length_special_encoding() {
-        // 0b11_000010 → special encoding, sub-type 2 (INT32)
-        let data = [0b11_000010u8];
-        let mut rdr = make_test_reader(&data);
-        match rdr.read_length().unwrap() {
-            LenResult::Special(enc) => assert_eq!(enc, RDB_ENC_INT32),
-            _ => panic!("expected Special"),
-        }
-    }
-
-    // --- String encoding tests ---
-
-    #[test]
-    fn test_string_raw() {
-        // Length 5, then "hello"
-        let data = [5u8, b'h', b'e', b'l', b'l', b'o'];
-        let mut rdr = make_test_reader(&data);
-        assert_eq!(rdr.read_string().unwrap(), b"hello");
-    }
-
-    #[test]
-    fn test_string_empty() {
-        let data = [0u8];
-        let mut rdr = make_test_reader(&data);
-        assert_eq!(rdr.read_string().unwrap(), b"");
-    }
-
-    #[test]
-    fn test_string_int8() {
-        // 0b11_000000 (INT8), then 42
-        let data = [0xC0u8, 42];
-        let mut rdr = make_test_reader(&data);
-        assert_eq!(rdr.read_string().unwrap(), b"42");
-    }
-
-    #[test]
-    fn test_string_int8_negative() {
-        // 0xC0 (INT8), then 0xFE = -2 as signed
-        let data = [0xC0u8, 0xFE];
-        let mut rdr = make_test_reader(&data);
-        assert_eq!(rdr.read_string().unwrap(), b"-2");
-    }
-
-    #[test]
-    fn test_string_int16() {
-        // 0xC1 (INT16), then 0xE8, 0x03 = 1000 LE
-        let data = [0xC1u8, 0xE8, 0x03];
-        let mut rdr = make_test_reader(&data);
-        assert_eq!(rdr.read_string().unwrap(), b"1000");
-    }
-
-    #[test]
-    fn test_string_int32() {
-        // 0xC2 (INT32), then 0xD2, 0x02, 0x96, 0x49 = 1234567890 LE
-        let data = [0xC2u8, 0xD2, 0x02, 0x96, 0x49];
-        let mut rdr = make_test_reader(&data);
-        assert_eq!(rdr.read_string().unwrap(), b"1234567890");
-    }
-
-    // --- LZF tests ---
-
-    #[test]
-    fn test_lzf_decompress_literal_only() {
-        // ctrl=4 means literal of 5 bytes
-        let compressed = [4u8, b'h', b'e', b'l', b'l', b'o'];
-        let result = lzf_decompress(&compressed, 5).unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn test_lzf_decompress_with_backref() {
-        // "aaaa": literal "a" (ctrl=0, 'a'), then backref offset=1, len=3
-        // backref: len=3 means stored as 1 (len-2), offset=0 (1-based → stored as 0)
-        // ctrl byte: (1 << 5) | 0 = 0x20, offset low byte = 0x00
-        let compressed = [0u8, b'a', 0x20, 0x00];
-        let result = lzf_decompress(&compressed, 4).unwrap();
-        assert_eq!(result, b"aaaa");
-    }
-
-    // --- Iterator becomes terminal after hard I/O error ---
-
-    #[test]
-    fn test_iterator_terminal_on_truncated_input() {
-        // Minimal RDB: header + SELECTDB 0 + RESIZEDB + STRING key, then truncated
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0); // db 0
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1); // 1 key
-        data.push(0); // 0 expires
-        data.push(RDB_TYPE_STRING);
-        data.push(3); // key length 3
-        data.extend_from_slice(b"foo");
-        // value truncated -- no string follows
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let results: Vec<_> = reader.collect();
-        // Should get exactly one error, not an infinite stream of errors
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_err());
-    }
-
-    // --- Pending state does not leak across entries ---
-
-    #[test]
-    fn test_no_state_leak_after_unsupported_type() {
-        // Build: header + SELECTDB 0 + RESIZEDB +
-        //   EXPIRETIME_MS(999) + unsupported_type(listpack hash) + STRING("ok")
-        // The STRING entry should NOT inherit the TTL from the hash.
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(2);
-        data.push(0);
-
-        // EXPIRETIME_MS followed by a HASH_ZIPMAP (still unsupported single-blob type)
-        data.push(RDB_OPCODE_EXPIRETIME_MS);
-        data.extend_from_slice(&999i64.to_le_bytes());
-        data.push(RDB_TYPE_HASH_ZIPMAP);
-        data.push(7); // key length
-        data.extend_from_slice(b"thehash");
-        // Zipmap blob: dummy bytes (just needs to be consumable as a string)
-        data.push(4); // blob length 4
-        data.extend_from_slice(&[0, 0, 0, 0]); // dummy blob
-
-        // Second entry: STRING "ok" = "val", no TTL set
-        data.push(RDB_TYPE_STRING);
-        data.push(2);
-        data.extend_from_slice(b"ok");
-        data.push(3);
-        data.extend_from_slice(b"val");
-
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]); // dummy CRC
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let mut ok_expiry = None;
-        for entry in reader {
-            if let Ok(e) = &entry {
-                if e.key == b"ok" {
-                    ok_expiry = Some(e.expiry_ms);
-                }
-            }
-        }
-        assert_eq!(ok_expiry, Some(None), "TTL should not leak to next entry");
-    }
-
-    // --- Version validation ---
-
-    #[test]
-    fn test_unsupported_redis_version() {
-        let data = b"REDIS0099xxxxxxxxx";
-        assert!(matches!(
-            read_header(&mut Cursor::new(&data[..])),
-            Err(RdbError::UnsupportedVersion(99))
-        ));
-    }
-
-    #[test]
-    fn test_unsupported_valkey_version() {
-        let data = b"VALKEY999xxxxxxxxx";
-        assert!(matches!(
-            read_header(&mut Cursor::new(&data[..])),
-            Err(RdbError::UnsupportedVersion(999))
-        ));
-    }
-
-    // --- LZF overflow detection ---
-
-    #[test]
-    fn test_lzf_output_overflow_literal() {
-        // Literal of 5 bytes but expected_len is 3
-        let compressed = [4u8, b'h', b'e', b'l', b'l', b'o'];
-        assert!(lzf_decompress(&compressed, 3).is_err());
-    }
-
-    #[test]
-    fn test_lzf_output_overflow_backref() {
-        // "a" literal + backref that would produce 4 total, but expected is 2
-        let compressed = [0u8, b'a', 0x20, 0x00];
-        assert!(lzf_decompress(&compressed, 2).is_err());
-    }
-
-    // --- Unknown top-level byte is terminal ---
-
-    #[test]
-    fn test_unknown_opcode_is_terminal() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        // Byte 200 is not a valid opcode or type code
-        data.push(200);
-        // Followed by what looks like a valid STRING entry
-        data.push(RDB_TYPE_STRING);
-        data.push(1);
-        data.push(b'k');
-        data.push(1);
-        data.push(b'v');
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let results: Vec<_> = reader.collect();
-        // Should get exactly one terminal error, not a fabricated entry after it
-        assert_eq!(results.len(), 1);
-        assert!(matches!(&results[0], Err(RdbError::CorruptData(_))));
-    }
-
-    // --- Invalid version/magic pairing ---
-
-    #[test]
-    fn test_redis_version_12_rejected() {
-        // REDIS version 12 is a foreign version (12-79), rejected in strict mode
-        let data = b"REDIS0012xxxxxxxxx";
-        assert!(matches!(
-            read_header(&mut Cursor::new(&data[..])),
-            Err(RdbError::UnsupportedVersion(12))
-        ));
-    }
-
-    #[test]
-    fn test_redis_version_0_rejected() {
-        let data = b"REDIS0000xxxxxxxxx";
-        assert!(matches!(
-            read_header(&mut Cursor::new(&data[..])),
-            Err(RdbError::UnsupportedVersion(0))
-        ));
-    }
-
-    #[test]
-    fn test_valkey_version_012_rejected() {
-        // VALKEY012 is not a valid Valkey version (only 080 is)
-        let data = b"VALKEY012xxxxxxxxx";
-        assert!(matches!(
-            read_header(&mut Cursor::new(&data[..])),
-            Err(RdbError::UnsupportedVersion(12))
-        ));
-    }
-
-    // --- Double value format (ZSET v1) ---
-
-    #[test]
-    #[allow(clippy::approx_constant)]
-    fn test_read_double_value_normal() {
-        // len=4, then "3.14"
-        let data = [4u8, b'3', b'.', b'1', b'4'];
-        let mut rdr = make_test_reader(&data);
-        let v = rdr.read_double_value().unwrap();
-        assert!((v - 3.14).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_read_double_value_special() {
-        // 255 = -inf, 254 = +inf, 253 = NaN
-        let mut rdr = make_test_reader(&[255u8]);
-        assert!(rdr.read_double_value().unwrap().is_infinite());
-
-        let mut rdr = make_test_reader(&[254u8]);
-        assert!(rdr.read_double_value().unwrap().is_infinite());
-
-        let mut rdr = make_test_reader(&[253u8]);
-        assert!(rdr.read_double_value().unwrap().is_nan());
-    }
-
-    // --- Test helper ---
-
-    // --- Quicklist edge-case tests ---
-
-    #[test]
-    fn test_quicklist2_invalid_container() {
-        // Quicklist v2 with container=3 should fail
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        data.push(RDB_TYPE_LIST_QUICKLIST_2);
-        data.push(3); // key "ql2"
-        data.extend_from_slice(b"ql2");
-        data.push(1); // 1 node
-        data.push(3); // container=3 (INVALID)
-        data.push(3); // blob len
-        data.extend_from_slice(b"abc");
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let results: Vec<_> = reader.collect();
-        assert_eq!(results.len(), 1);
-        assert!(matches!(&results[0], Err(RdbError::CorruptData(_))));
-    }
-
-    #[test]
-    fn test_quicklist_v1_empty_node() {
-        // Quicklist v1 with one ziplist node containing zero entries
-        let empty_zl = {
-            // zlbytes=11, zltail=10, zllen=0, end=0xFF
-            let mut zl = Vec::new();
-            zl.extend_from_slice(&11u32.to_le_bytes()); // zlbytes
-            zl.extend_from_slice(&10u32.to_le_bytes()); // zltail
-            zl.extend_from_slice(&0u16.to_le_bytes());  // zllen
-            zl.push(0xFF);
-            zl
-        };
-
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        data.push(RDB_TYPE_LIST_QUICKLIST);
-        data.push(4); // key "empt"
-        data.extend_from_slice(b"empt");
-        data.push(1); // 1 node
-        // node blob (length-prefixed ziplist)
-        data.push(empty_zl.len() as u8);
-        data.extend_from_slice(&empty_zl);
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"empt");
-        assert!(matches!(&entries[0].value, RdbValue::List(v) if v.is_empty()));
-    }
-
-    #[test]
-    fn test_quicklist2_zero_nodes() {
-        // Quicklist v2 with node count = 0 → empty list
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        data.push(RDB_TYPE_LIST_QUICKLIST_2);
-        data.push(4); // key "zero"
-        data.extend_from_slice(b"zero");
-        data.push(0); // 0 nodes
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"zero");
-        assert!(matches!(&entries[0].value, RdbValue::List(v) if v.is_empty()));
-    }
-
-    /// Build a minimal RDB with one key-value entry from raw value bytes.
-    /// The caller provides the type code and pre-encoded value payload.
-    fn make_rdb_entry(type_code: u8, key: &[u8], value_payload: &[u8]) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        data.push(type_code);
-        data.push(key.len() as u8);
-        data.extend_from_slice(key);
-        data.extend_from_slice(value_payload);
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]); // dummy CRC
-        data
-    }
-
-    /// Encode a length using RDB length encoding (for test payloads).
-    fn rdb_len(n: usize) -> Vec<u8> {
-        if n < 64 {
-            vec![n as u8]
-        } else if n < 16384 {
-            vec![(0x40 | (n >> 8)) as u8, (n & 0xFF) as u8]
-        } else {
-            panic!("test helper only supports lengths < 16384");
-        }
-    }
-
-    /// Encode a string with RDB length prefix (for test payloads).
-    fn rdb_string(s: &[u8]) -> Vec<u8> {
-        let mut buf = rdb_len(s.len());
-        buf.extend_from_slice(s);
-        buf
-    }
-
-    // --- Plain list (type 1) ---
-
-    #[test]
-    fn test_plain_list() {
-        let mut payload = rdb_len(3); // 3 elements
-        payload.extend_from_slice(&rdb_string(b"alpha"));
-        payload.extend_from_slice(&rdb_string(b"beta"));
-        payload.extend_from_slice(&rdb_string(b"gamma"));
-        let data = make_rdb_entry(RDB_TYPE_LIST, b"mylist", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].type_name(), "list");
-        assert_eq!(entries[0].encoding_name(), "linkedlist");
-        match &entries[0].value {
-            RdbValue::List(elems) => {
-                assert_eq!(elems.len(), 3);
-                assert_eq!(elems[0], b"alpha");
-                assert_eq!(elems[1], b"beta");
-                assert_eq!(elems[2], b"gamma");
-            }
-            other => panic!("expected List, got {:?}", other),
-        }
-    }
-
-    // --- Plain set (type 2) ---
-
-    #[test]
-    fn test_plain_set() {
-        let mut payload = rdb_len(2);
-        payload.extend_from_slice(&rdb_string(b"x"));
-        payload.extend_from_slice(&rdb_string(b"y"));
-        let data = make_rdb_entry(RDB_TYPE_SET, b"myset", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].type_name(), "set");
-        assert_eq!(entries[0].encoding_name(), "hashtable");
-        match &entries[0].value {
-            RdbValue::Set(members) => {
-                assert_eq!(members.len(), 2);
-                assert!(members.contains(&b"x".to_vec()));
-                assert!(members.contains(&b"y".to_vec()));
-            }
-            other => panic!("expected Set, got {:?}", other),
-        }
-    }
-
-    // --- Plain hash (type 4) ---
-
-    #[test]
-    fn test_plain_hash() {
-        let mut payload = rdb_len(2); // 2 field-value pairs
-        payload.extend_from_slice(&rdb_string(b"name"));
-        payload.extend_from_slice(&rdb_string(b"alice"));
-        payload.extend_from_slice(&rdb_string(b"age"));
-        payload.extend_from_slice(&rdb_string(b"30"));
-        let data = make_rdb_entry(RDB_TYPE_HASH, b"myhash", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].type_name(), "hash");
-        assert_eq!(entries[0].encoding_name(), "hashtable");
-        match &entries[0].value {
-            RdbValue::Hash(fields) => {
-                assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0].field, b"name");
-                assert_eq!(fields[0].value, b"alice");
-                assert_eq!(fields[0].expiry_ms, None);
-                assert_eq!(fields[1].field, b"age");
-                assert_eq!(fields[1].value, b"30");
-            }
-            other => panic!("expected Hash, got {:?}", other),
-        }
-    }
-
-    // --- Sorted set v1 (type 3) ---
-
-    #[test]
-    fn test_plain_zset_v1() {
-        let mut payload = rdb_len(2);
-        payload.extend_from_slice(&rdb_string(b"first"));
-        // rdbLoadDoubleValue: 3-byte ASCII "1.5"
-        payload.push(3); // length byte
-        payload.extend_from_slice(b"1.5");
-        payload.extend_from_slice(&rdb_string(b"second"));
-        payload.push(1);
-        payload.extend_from_slice(b"3");
-        let data = make_rdb_entry(RDB_TYPE_ZSET, b"myzset", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].type_name(), "zset");
-        assert_eq!(entries[0].encoding_name(), "skiplist");
-        match &entries[0].value {
-            RdbValue::SortedSet(pairs) => {
-                assert_eq!(pairs.len(), 2);
-                assert_eq!(pairs[0].0, b"first");
-                assert_eq!(pairs[0].1, 1.5);
-                assert_eq!(pairs[1].0, b"second");
-                assert_eq!(pairs[1].1, 3.0);
-            }
-            other => panic!("expected SortedSet, got {:?}", other),
-        }
-    }
-
-    // --- Sorted set v2 (type 5) ---
-
-    #[test]
-    fn test_plain_zset_v2() {
-        let mut payload = rdb_len(1);
-        payload.extend_from_slice(&rdb_string(b"member"));
-        payload.extend_from_slice(&2.5f64.to_le_bytes());
-        let data = make_rdb_entry(RDB_TYPE_ZSET_2, b"myzset2", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].encoding_name(), "skiplist");
-        match &entries[0].value {
-            RdbValue::SortedSet(pairs) => {
-                assert_eq!(pairs.len(), 1);
-                assert_eq!(pairs[0].0, b"member");
-                assert_eq!(pairs[0].1, 2.5);
-            }
-            other => panic!("expected SortedSet, got {:?}", other),
-        }
-    }
-
-    // --- HASH_2 (type 22, per-field TTL) ---
-
-    #[test]
-    fn test_hash_2() {
-        let mut payload = rdb_len(2);
-        // field 1: no TTL (ttl=-1, Valkey's EXPIRY_NONE sentinel)
-        payload.extend_from_slice(&rdb_string(b"name"));
-        payload.extend_from_slice(&rdb_string(b"bob"));
-        payload.extend_from_slice(&(-1i64).to_le_bytes());
-        // field 2: with TTL
-        payload.extend_from_slice(&rdb_string(b"session"));
-        payload.extend_from_slice(&rdb_string(b"abc123"));
-        payload.extend_from_slice(&1700000000000i64.to_le_bytes());
-        let data = make_rdb_entry(RDB_TYPE_HASH_2, b"myhash2", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].type_name(), "hash");
-        match &entries[0].value {
-            RdbValue::Hash(fields) => {
-                assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0].field, b"name");
-                assert_eq!(fields[0].value, b"bob");
-                assert_eq!(fields[0].expiry_ms, None); // ttl=-1 → None
-                assert_eq!(fields[1].field, b"session");
-                assert_eq!(fields[1].value, b"abc123");
-                assert_eq!(fields[1].expiry_ms, Some(1_700_000_000_000));
-            }
-            other => panic!("expected Hash, got {:?}", other),
-        }
-    }
-
-    // --- LZF round-trip through read_string ---
-
-    #[test]
-    fn test_lzf_string_through_read_string() {
-        // Build an LZF-compressed string "aaaaa" (5 bytes of 'a')
-        // LZF format: literal 'a' (ctrl=0, len=1), then backref (ctrl >> 5 = 2 → len=4, offset=0)
-        let compressed = [0u8, b'a', 0x40, 0x00]; // literal 'a' + backref len=4 offset=1
-        let expected = b"aaaaa";
-
-        let mut data = Vec::new();
-        // length prefix: special encoding (top 2 bits = 11 = ENCVAL)
-        data.push(0xC3); // 11_000011 = ENCVAL, sub-type 3 = LZF
-        // compressed length
-        data.push(compressed.len() as u8); // 4
-        // uncompressed length
-        data.push(expected.len() as u8); // 6
-        data.extend_from_slice(&compressed);
-
-        let mut reader = make_test_reader(&data);
-        let result = reader.read_string().unwrap();
-        assert_eq!(result, expected);
-    }
-
-    // --- EXPIRETIME (seconds, opcode 253) ---
-
-    #[test]
-    fn test_expiretime_seconds() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        // EXPIRETIME with 4-byte seconds value
-        data.push(RDB_OPCODE_EXPIRETIME);
-        data.extend_from_slice(&1700000000i32.to_le_bytes());
-        // STRING entry
-        data.push(RDB_TYPE_STRING);
-        data.push(3);
-        data.extend_from_slice(b"key");
-        data.push(3);
-        data.extend_from_slice(b"val");
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"key");
-        // seconds * 1000 = milliseconds
-        assert_eq!(entries[0].expiry_ms, Some(1_700_000_000_000));
-    }
-
-    // --- FUNCTION2 skip ---
-
-    #[test]
-    fn test_function2_skipped() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        // FUNCTION2 with a dummy payload
-        data.push(RDB_OPCODE_FUNCTION2);
-        data.push(5); // string length 5
-        data.extend_from_slice(b"dummy");
-        // STRING entry after
-        data.push(RDB_TYPE_STRING);
-        data.push(1);
-        data.push(b'k');
-        data.push(1);
-        data.push(b'v');
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"k");
-    }
-
-    // --- MODULE_AUX skip ---
-
-    #[test]
-    fn test_module_aux_skipped() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"VALKEY080");
-        data.push(RDB_OPCODE_SELECTDB);
-        data.push(0);
-        data.push(RDB_OPCODE_RESIZEDB);
-        data.push(1);
-        data.push(0);
-        // MODULE_AUX: module_id (length), when_opcode (length), when (length), then module data
-        data.push(RDB_OPCODE_MODULE_AUX);
-        data.push(42); // module_id (6-bit length value)
-        data.push(0);  // when_opcode
-        data.push(0);  // when
-        // Module data: just an EOF opcode (0)
-        data.push(0);  // RDB_MODULE_OPCODE_EOF
-        // STRING entry after
-        data.push(RDB_TYPE_STRING);
-        data.push(1);
-        data.push(b'k');
-        data.push(1);
-        data.push(b'v');
-        data.push(RDB_OPCODE_EOF);
-        data.extend_from_slice(&[0u8; 8]);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap();
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, b"k");
-    }
-
-    // --- read_double_value error paths ---
-
-    #[test]
-    fn test_read_double_value_invalid_string() {
-        // A 3-byte ASCII string "abc" that isn't a valid float
-        let mut rdr = make_test_reader(&[3u8, b'a', b'b', b'c']);
-        assert!(rdr.read_double_value().is_err());
-    }
-
-    #[test]
-    fn test_read_double_value_stringified_inf_nan() {
-        // Valkey can produce stringified "inf", "-inf", "nan" in ZSET v1 scores.
-        // Rust's f64::from_str handles these correctly.
-        let mut data = vec![3u8];
-        data.extend_from_slice(b"inf");
-        let mut rdr = make_test_reader(&data);
-        let v = rdr.read_double_value().unwrap();
-        assert!(v.is_infinite() && v.is_sign_positive());
-
-        let mut data = vec![4u8];
-        data.extend_from_slice(b"-inf");
-        let mut rdr = make_test_reader(&data);
-        let v = rdr.read_double_value().unwrap();
-        assert!(v.is_infinite() && v.is_sign_negative());
-
-        let mut data = vec![3u8];
-        data.extend_from_slice(b"NaN");
-        let mut rdr = make_test_reader(&data);
-        let v = rdr.read_double_value().unwrap();
-        assert!(v.is_nan());
-    }
-
-    // --- Chunked reading tests ---
-
-    #[test]
-    fn test_chunked_hash_splits_correctly() {
-        // 10-field hash with max_key_elements=3 → 4 entries (3+3+3+1)
-        let mut payload = rdb_len(10);
-        for i in 0..10 {
-            payload.extend_from_slice(&rdb_string(format!("field_{i}").as_bytes()));
-            payload.extend_from_slice(&rdb_string(format!("value_{i}").as_bytes()));
-        }
-        let data = make_rdb_entry(RDB_TYPE_HASH, b"bighash", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(3);
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 4, "10 fields / 3 = 4 chunks (3+3+3+1)");
-
-        // All chunks should have the same key and total_elements
-        for entry in &entries {
-            assert_eq!(entry.key, b"bighash");
-            assert_eq!(entry.total_elements, Some(10));
-        }
-
-        // Check element_offset values
-        assert_eq!(entries[0].element_offset, Some(0));
-        assert_eq!(entries[1].element_offset, Some(3));
-        assert_eq!(entries[2].element_offset, Some(6));
-        assert_eq!(entries[3].element_offset, Some(9));
-
-        // Check chunk sizes
-        let sizes: Vec<usize> = entries
-            .iter()
-            .map(|e| match &e.value {
-                RdbValue::Hash(f) => f.len(),
-                other => panic!("expected Hash, got {:?}", other),
-            })
-            .collect();
-        assert_eq!(sizes, vec![3, 3, 3, 1]);
-
-        // Verify all 10 fields are present in order
-        let all_fields: Vec<String> = entries
-            .iter()
-            .flat_map(|e| match &e.value {
-                RdbValue::Hash(f) => f.iter().map(|hf| String::from_utf8(hf.field.clone()).unwrap()).collect::<Vec<_>>(),
-                _ => vec![],
-            })
-            .collect();
-        let expected: Vec<String> = (0..10).map(|i| format!("field_{i}")).collect();
-        assert_eq!(all_fields, expected);
-    }
-
-    #[test]
-    fn test_chunked_list_index_continuity() {
-        // 8-element list with max=3 → verify indices across chunks are 0..8
-        let mut payload = rdb_len(8);
-        for i in 0..8 {
-            payload.extend_from_slice(&rdb_string(format!("item_{i}").as_bytes()));
-        }
-        let data = make_rdb_entry(RDB_TYPE_LIST, b"biglist", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(3);
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 3, "8 elements / 3 = 3 chunks (3+3+2)");
-
-        // Verify element_offset continuity
-        assert_eq!(entries[0].element_offset, Some(0));
-        assert_eq!(entries[1].element_offset, Some(3));
-        assert_eq!(entries[2].element_offset, Some(6));
-
-        // All have total_elements=8
-        for e in &entries {
-            assert_eq!(e.total_elements, Some(8));
-        }
-
-        // Collect all elements in order
-        let all_items: Vec<String> = entries
-            .iter()
-            .flat_map(|e| match &e.value {
-                RdbValue::List(elems) => elems.iter().map(|el| String::from_utf8(el.clone()).unwrap()).collect::<Vec<_>>(),
-                _ => vec![],
-            })
-            .collect();
-        let expected: Vec<String> = (0..8).map(|i| format!("item_{i}")).collect();
-        assert_eq!(all_items, expected);
-    }
-
-    #[test]
-    fn test_no_chunking_below_threshold() {
-        // 5-element set with max=10 → single entry, total_elements=None
-        let mut payload = rdb_len(5);
-        for i in 0..5 {
-            payload.extend_from_slice(&rdb_string(format!("m_{i}").as_bytes()));
-        }
-        let data = make_rdb_entry(RDB_TYPE_SET, b"smallset", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(10);
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].total_elements, None);
-        assert_eq!(entries[0].element_offset, None);
-        match &entries[0].value {
-            RdbValue::Set(members) => assert_eq!(members.len(), 5),
-            other => panic!("expected Set, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_no_chunking_for_compact_types() {
-        // Listpack-encoded hash — should never chunk regardless of max
-        let f = std::fs::File::open(format!(
-            "{}/../../tests/fixtures/hash_listpack.rdb",
-            env!("CARGO_MANIFEST_DIR")
-        )).unwrap();
-        let reader = RdbReader::new(f).unwrap().with_max_key_elements(1);
-        let entries: Vec<_> = reader.filter_map(|e| e.ok()).collect();
-        // Should be one entry regardless of max_key_elements=1
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].total_elements, None);
-        assert_eq!(entries[0].element_offset, None);
-    }
-
-    #[test]
-    fn test_chunked_zset_v2() {
-        // 6-element zset_2 with max=4 → 2 chunks (4+2)
-        let mut payload = rdb_len(6);
-        for i in 0..6u64 {
-            payload.extend_from_slice(&rdb_string(format!("member_{i}").as_bytes()));
-            payload.extend_from_slice(&(i as f64).to_le_bytes());
-        }
-        let data = make_rdb_entry(RDB_TYPE_ZSET_2, b"myzset", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(4);
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].total_elements, Some(6));
-        assert_eq!(entries[0].element_offset, Some(0));
-        assert_eq!(entries[1].total_elements, Some(6));
-        assert_eq!(entries[1].element_offset, Some(4));
-
-        // Verify all members/scores
-        let all_pairs: Vec<(String, f64)> = entries
-            .iter()
-            .flat_map(|e| match &e.value {
-                RdbValue::SortedSet(pairs) => pairs.iter().map(|(m, s)| (String::from_utf8(m.clone()).unwrap(), *s)).collect::<Vec<_>>(),
-                _ => vec![],
-            })
-            .collect();
-        assert_eq!(all_pairs.len(), 6);
-        for (i, (member, score)) in all_pairs.iter().enumerate() {
-            assert_eq!(member, &format!("member_{i}"));
-            assert!((score - i as f64).abs() < f64::EPSILON);
-        }
-    }
-
-    #[test]
-    fn test_chunked_set() {
-        // 7-element set with max=3 → 3 chunks (3+3+1)
-        let mut payload = rdb_len(7);
-        for i in 0..7 {
-            payload.extend_from_slice(&rdb_string(format!("m_{i}").as_bytes()));
-        }
-        let data = make_rdb_entry(RDB_TYPE_SET, b"bigset", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(3);
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 3, "7 members / 3 = 3 chunks (3+3+1)");
-
-        for e in &entries {
-            assert_eq!(e.key, b"bigset");
-            assert_eq!(e.total_elements, Some(7));
-        }
-        assert_eq!(entries[0].element_offset, Some(0));
-        assert_eq!(entries[1].element_offset, Some(3));
-        assert_eq!(entries[2].element_offset, Some(6));
-
-        let all_members: Vec<String> = entries
-            .iter()
-            .flat_map(|e| match &e.value {
-                RdbValue::Set(m) => m.iter().map(|v| String::from_utf8(v.clone()).unwrap()).collect::<Vec<_>>(),
-                _ => vec![],
-            })
-            .collect();
-        let expected: Vec<String> = (0..7).map(|i| format!("m_{i}")).collect();
-        assert_eq!(all_members, expected);
-    }
-
-    #[test]
-    fn test_chunked_zset_v1() {
-        // 5-element zset v1 with max=2 → 3 chunks (2+2+1)
-        let mut payload = rdb_len(5);
-        for i in 0..5 {
-            payload.extend_from_slice(&rdb_string(format!("z_{i}").as_bytes()));
-            let score_str = format!("{}.5", i);
-            payload.push(score_str.len() as u8);
-            payload.extend_from_slice(score_str.as_bytes());
-        }
-        let data = make_rdb_entry(RDB_TYPE_ZSET, b"zset_v1", &payload);
-
-        let reader = RdbReader::new(Cursor::new(data)).unwrap().with_max_key_elements(2);
-        let entries: Vec<_> = reader.map(|e| e.unwrap()).collect();
-        assert_eq!(entries.len(), 3, "5 elements / 2 = 3 chunks (2+2+1)");
-
-        for e in &entries {
-            assert_eq!(e.key, b"zset_v1");
-            assert_eq!(e.total_elements, Some(5));
-        }
-        assert_eq!(entries[0].element_offset, Some(0));
-        assert_eq!(entries[1].element_offset, Some(2));
-        assert_eq!(entries[2].element_offset, Some(4));
-
-        let all_pairs: Vec<(String, f64)> = entries
-            .iter()
-            .flat_map(|e| match &e.value {
-                RdbValue::SortedSet(pairs) => pairs.iter().map(|(m, s)| (String::from_utf8(m.clone()).unwrap(), *s)).collect::<Vec<_>>(),
-                _ => vec![],
-            })
-            .collect();
-        assert_eq!(all_pairs.len(), 5);
-        for (i, (member, score)) in all_pairs.iter().enumerate() {
-            assert_eq!(member, &format!("z_{i}"));
-            assert!((*score - (i as f64 + 0.5)).abs() < f64::EPSILON);
-        }
-    }
-
-    // --- Intset MAX_INTSET_ELEMENTS cap ---
-
-    #[test]
-    fn test_intset_element_cap() {
-        // Forge an intset header claiming 20M int16 elements (exceeds 10M cap)
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&2u32.to_le_bytes());         // encoding: int16
-        blob.extend_from_slice(&20_000_000u32.to_le_bytes()); // length: 20M
-        // Don't need actual data — should fail before reading elements
-        assert!(crate::intset::decode(&blob).is_err());
-    }
-
-    // --- Test helper ---
-
-    /// Create a minimal RdbReader from raw bytes (skips header parsing).
-    fn make_test_reader(data: &[u8]) -> RdbReader<Cursor<Vec<u8>>> {
-        RdbReader {
-            reader: CrcReader::new(BufReader::new(Cursor::new(data.to_vec())), 0),
-            header: RdbHeader {
-                magic: RdbMagic::Valkey,
-                version: 80,
-            },
-            metadata: RdbMetadata::default(),
-            current_db: 0,
-            pending_expiry_ms: None,
-            pending_lru_idle: None,
-            pending_lfu_freq: None,
-            preamble_byte: None,
-            finished: false,
-            max_key_elements: None,
-            chunked: None,
-        }
-    }
-}
+#[path = "reader_tests.rs"]
+mod tests;

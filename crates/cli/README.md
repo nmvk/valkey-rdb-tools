@@ -28,7 +28,7 @@ Options:
 | `-f, --format` | `parquet` | `parquet`, `arrow-ipc`, `csv`, `json` |
 | `--compression` | `zstd` | `zstd`, `snappy`, `lz4`, `gzip`, `none` |
 | `--db` | all | Filter by database number |
-| `--type` | all | Filter by type (`string`, `list`, `set`, `zset`, `hash`, `geo`, `hll`) |
+| `--type` | all | Filter by type (`string`, `list`, `set`, `zset`, `hash`, `geo`, `hll`, `module`, `stream`) |
 | `--key-pattern` | all | Filter keys by glob |
 | `--batch-size` | 65536 | Rows per Arrow RecordBatch |
 | `--row-group-size` | 1048576 | Rows per Parquet row group |

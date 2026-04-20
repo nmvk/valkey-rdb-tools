@@ -250,17 +250,19 @@ mod tests {
     }
 
     #[test]
-    fn hll_cached_cardinality_invalid_cache() {
-        // Set MSB to indicate cache is invalid.
-        let data = make_hll(0, 1u64 << 63);
-        assert_eq!(hll_cached_cardinality(&data), -1);
-    }
-
-    #[test]
-    fn hll_cached_cardinality_invalid_cache_with_value() {
-        // MSB set but lower bits have a value — still invalid.
-        let data = make_hll(0, (1u64 << 63) | 999);
-        assert_eq!(hll_cached_cardinality(&data), -1);
+    fn hll_cached_cardinality_invalid_cache_ignores_low_bits() {
+        // MSB of the cached-cardinality field indicates "cache invalid";
+        // lower bits must be ignored. Two parametrized cases pin both
+        // all-zero and non-zero low bits — previously they were two
+        // separate tests asserting the same invariant.
+        for low in [0u64, 999] {
+            let data = make_hll(0, (1u64 << 63) | low);
+            assert_eq!(
+                hll_cached_cardinality(&data),
+                -1,
+                "MSB set should yield -1 regardless of low bits = {low}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

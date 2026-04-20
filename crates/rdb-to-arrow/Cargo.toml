@@ -23,3 +23,4 @@ parquet = { workspace = true, optional = true, features = ["arrow", "zstd", "sna
 [dev-dependencies]
 parquet = { workspace = true, features = ["arrow"] }
 bytes = "1"
+serde_json = "1"

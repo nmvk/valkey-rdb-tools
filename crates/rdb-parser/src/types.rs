@@ -6,7 +6,9 @@ use std::fmt;
 /// RDB magic string type — REDIS (legacy) or VALKEY (9.0+).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RdbMagic {
+    /// Legacy Redis magic; RDB versions 1–11.
     Redis,
+    /// Valkey magic (file starts with `VALKEY`); RDB version 80.
     Valkey,
 }
 
@@ -21,18 +23,26 @@ impl fmt::Display for RdbMagic {
 
 /// Parsed RDB file header.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RdbHeader {
+    /// Which magic string the file starts with.
     pub magic: RdbMagic,
+    /// RDB format version (1–11 for Redis, 80 for Valkey 9.0+).
     pub version: u32,
 }
 
-/// File-level metadata extracted from AUX fields.
+/// File-level metadata extracted from AUX fields at the start of the RDB.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RdbMetadata {
+    /// All AUX key/value pairs encountered, in insertion order (by BTreeMap
+    /// key ordering). Non-UTF-8 AUX keys are rejected as `CorruptData`;
+    /// values with non-UTF-8 bytes are passed through lossy conversion.
     pub aux: BTreeMap<String, String>,
 }
 
 impl RdbMetadata {
+    /// Server version string from the `valkey-ver` or `redis-ver` AUX field.
     pub fn server_version(&self) -> Option<&str> {
         self.aux
             .get("valkey-ver")
@@ -40,18 +50,23 @@ impl RdbMetadata {
             .map(|s| s.as_str())
     }
 
+    /// Unix timestamp (seconds) when the RDB was written, from the `ctime`
+    /// AUX field. `None` if the field is missing or not parseable as `u64`.
     pub fn ctime(&self) -> Option<u64> {
         self.aux.get("ctime").and_then(|s| s.parse().ok())
     }
 
+    /// Server memory use (bytes) at the time of snapshot, from `used-mem`.
     pub fn used_mem(&self) -> Option<u64> {
         self.aux.get("used-mem").and_then(|s| s.parse().ok())
     }
 
+    /// Replication ID, from the `repl-id` AUX field.
     pub fn repl_id(&self) -> Option<&str> {
         self.aux.get("repl-id").map(|s| s.as_str())
     }
 
+    /// Replication offset, from the `repl-offset` AUX field.
     pub fn repl_offset(&self) -> Option<i64> {
         self.aux.get("repl-offset").and_then(|s| s.parse().ok())
     }
@@ -60,9 +75,60 @@ impl RdbMetadata {
 /// A single hash field with optional per-field TTL (Valkey 9.0 HASH_2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HashField {
+    /// Field name (arbitrary bytes).
     pub field: Vec<u8>,
+    /// Field value (arbitrary bytes).
     pub value: Vec<u8>,
+    /// Per-field expiration in Unix milliseconds, if set. `None` means the
+    /// field follows the key's TTL, not its own.
     pub expiry_ms: Option<i64>,
+}
+
+/// A single typed value from a module's RDB serialization stream.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ModuleValue {
+    /// Signed 64-bit integer.
+    SignedInt(i64),
+    /// Unsigned 64-bit integer.
+    UnsignedInt(u64),
+    /// 32-bit IEEE 754 float.
+    Float(f32),
+    /// 64-bit IEEE 754 double.
+    Double(f64),
+    /// Arbitrary byte string.
+    String(Vec<u8>),
+}
+
+/// Module data extracted from `RDB_TYPE_MODULE_2` entries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleData {
+    /// Decoded module name (9-char base-64 encoded identifier).
+    pub module_name: String,
+    /// Module encoding version (low 10 bits of the module ID).
+    pub module_version: u32,
+    /// Typed values emitted by the module's RDB serializer, in order.
+    pub values: Vec<ModuleValue>,
+}
+
+/// A single stream entry (one XADD).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamEntry {
+    /// Stream ID in "ms-seq" format (e.g., "1700000000000-0").
+    pub id: String,
+    /// Field-value pairs for this entry.
+    pub fields: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Parsed stream data from `RDB_TYPE_STREAM_LISTPACKS*` entries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamData {
+    /// Non-deleted stream entries.
+    pub entries: Vec<StreamEntry>,
+    /// Total length as reported by the RDB metadata (non-deleted entries).
+    pub length: u64,
+    /// Last entry ID.
+    pub last_id: String,
 }
 
 /// The value portion of an RDB key-value entry.
@@ -84,12 +150,16 @@ pub enum RdbValue {
     /// Hash: field-value pairs with optional per-field TTL.
     Hash(Vec<HashField>),
 
-    // TODO: Stream(StreamData) — to be added when stream parsing is implemented.
-    // TODO: Module(Vec<u8>) — to be added when module parsing is implemented.
+    /// Module data: typed value stream from any module type.
+    Module(ModuleData),
+
+    /// Stream data: entries with IDs and field-value pairs.
+    Stream(StreamData),
 }
 
 /// A single parsed RDB key-value entry with metadata.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RdbEntry {
     /// Database number (from SELECTDB opcode).
     pub db: u32,
@@ -123,6 +193,71 @@ pub struct RdbEntry {
 }
 
 impl RdbEntry {
+    /// Create a new entry with the given key, value, and type code. All
+    /// other fields default to their zero/`None` values; use the `with_*`
+    /// methods to attach metadata.
+    ///
+    /// `RdbEntry` is `#[non_exhaustive]`, so external code must go through
+    /// this constructor (or a crate that yields `RdbEntry`) rather than
+    /// struct-literal syntax.
+    pub fn new(key: Vec<u8>, value: RdbValue, type_code: u8) -> Self {
+        Self {
+            db: 0,
+            key,
+            value,
+            type_code,
+            expiry_ms: None,
+            lru_idle_secs: None,
+            lfu_frequency: None,
+            total_elements: None,
+            element_offset: None,
+        }
+    }
+
+    /// Set the database number (SELECTDB).
+    #[must_use]
+    pub fn with_db(mut self, db: u32) -> Self {
+        self.db = db;
+        self
+    }
+
+    /// Set the expiry in Unix milliseconds. Pass `None` to clear.
+    #[must_use]
+    pub fn with_expiry_ms(mut self, expiry_ms: Option<i64>) -> Self {
+        self.expiry_ms = expiry_ms;
+        self
+    }
+
+    /// Set the LRU idle time in seconds (IDLE opcode).
+    #[must_use]
+    pub fn with_lru_idle_secs(mut self, lru_idle_secs: Option<u64>) -> Self {
+        self.lru_idle_secs = lru_idle_secs;
+        self
+    }
+
+    /// Set the LFU frequency counter (FREQ opcode, 0–255).
+    #[must_use]
+    pub fn with_lfu_frequency(mut self, lfu_frequency: Option<u8>) -> Self {
+        self.lfu_frequency = lfu_frequency;
+        self
+    }
+
+    /// Mark this entry as one chunk of a larger collection: `total` is the
+    /// full element count across all chunks, `offset` is the index of the
+    /// first element in this chunk.
+    #[must_use]
+    pub fn with_chunking(mut self, total: Option<u64>, offset: Option<u64>) -> Self {
+        self.total_elements = total;
+        self.element_offset = offset;
+        self
+    }
+
+    /// Returns true if this is the first (or only) chunk of a key.
+    /// For non-chunked entries this always returns true.
+    pub fn is_first_chunk(&self) -> bool {
+        self.element_offset.is_none() || self.element_offset == Some(0)
+    }
+
     /// Returns the logical type name (string, list, set, zset, hash, stream, module).
     pub fn type_name(&self) -> &'static str {
         crate::opcodes::type_name(self.type_code)
@@ -172,7 +307,14 @@ impl fmt::Display for RdbError {
     }
 }
 
-impl std::error::Error for RdbError {}
+impl std::error::Error for RdbError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RdbError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

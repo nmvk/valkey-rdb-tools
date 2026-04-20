@@ -6,48 +6,88 @@ use arrow::record_batch::RecordBatch;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use std::collections::HashSet;
+
 use rdb_parser::RdbReader;
 use rdb_to_arrow::{
-    is_geo_entry, metadata_from_rdb, type_tag_for, write_parquet, ArrowBatcher, ArrowConvertError,
-    BatcherConfig, ParquetConfig, TypeTag,
+    metadata_from_rdb, parse_compression, summarize_entries, write_parquet, ArrowBatcher,
+    ArrowConvertError, BatcherConfig, Heuristic, ParquetConfig, TypeTag,
 };
+
+fn parse_heuristics(s: &str) -> PyResult<HashSet<Heuristic>> {
+    Heuristic::parse_set(s).map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+fn make_batcher_config(
+    batch_size: usize,
+    batch_bytes: Option<usize>,
+    max_entry_bytes: Option<usize>,
+    heuristics: &str,
+) -> PyResult<BatcherConfig> {
+    if batch_size == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be > 0"));
+    }
+    let heuristics = parse_heuristics(heuristics)?;
+    #[allow(clippy::field_reassign_with_default)] // conditional batch_bytes override
+    let config = {
+        let mut c = BatcherConfig::default();
+        c.batch_size = batch_size;
+        if let Some(bb) = batch_bytes {
+            c.batch_bytes = Some(bb);
+        }
+        c.max_entry_bytes = max_entry_bytes;
+        c.heuristics = heuristics;
+        c
+    };
+    Ok(config)
+}
 
 /// Read an RDB file and return a dict of {type_name: pyarrow.Table}.
 ///
 /// Collects all entries into memory. For large files, use read_batches() instead
 /// to process one batch at a time.
 #[pyfunction]
-#[pyo3(signature = (path, /, batch_size=65536, no_chunking=false))]
-fn read<'py>(py: Python<'py>, path: &str, batch_size: usize, no_chunking: bool) -> PyResult<Bound<'py, PyDict>> {
-    if batch_size == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "batch_size must be > 0",
-        ));
-    }
+#[pyo3(signature = (path, /, batch_size=65536, no_chunking=false, batch_bytes=None, max_entry_bytes=None, heuristic="all"))]
+fn read<'py>(
+    py: Python<'py>,
+    // Take `String` directly — the closure below needs to move an owned
+    // path into the `allow_threads` block. Previously we took `&str`
+    // and cloned it; letting pyo3 extract `String` up front skips the
+    // redundant allocation.
+    path: String,
+    batch_size: usize,
+    no_chunking: bool,
+    batch_bytes: Option<usize>,
+    max_entry_bytes: Option<usize>,
+    heuristic: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let config = make_batcher_config(batch_size, batch_bytes, max_entry_bytes, heuristic)?;
 
-    let file = File::open(path).map_err(io_to_py_err)?;
-    let reader = RdbReader::new(file).map_err(rdb_to_py_err)?;
-    let reader = if no_chunking {
-        reader.without_chunking()
-    } else {
-        reader
-    };
+    // Release GIL during RDB parsing + Arrow batch construction
+    let per_type: BTreeMap<TypeTag, Vec<RecordBatch>> = py.allow_threads(move || {
+        let file = File::open(&path).map_err(ThreadError::Io)?;
+        let reader = RdbReader::new(file).map_err(ThreadError::Rdb)?;
+        let reader = if no_chunking {
+            reader.without_chunking()
+        } else {
+            reader
+        };
 
-    let batcher = ArrowBatcher::new(BatcherConfig { batch_size, ..Default::default() });
-    let batch_iter = batcher.process(reader);
+        let batcher = ArrowBatcher::new(config);
+        let batch_iter = batcher.process(reader);
 
-    // Collect batches per type
-    let mut per_type: BTreeMap<TypeTag, Vec<RecordBatch>> = BTreeMap::new();
+        let mut per_type: BTreeMap<TypeTag, Vec<RecordBatch>> = BTreeMap::new();
+        for result in batch_iter {
+            let typed_batch = result.map_err(ThreadError::Arrow)?;
+            per_type
+                .entry(typed_batch.tag)
+                .or_default()
+                .push(typed_batch.batch);
+        }
+        Ok::<_, ThreadError>(per_type)
+    })?;
 
-    for result in batch_iter {
-        let typed_batch = result.map_err(arrow_to_py_err)?;
-        per_type
-            .entry(typed_batch.tag)
-            .or_default()
-            .push(typed_batch.batch);
-    }
-
-    // Convert to Python dict of {type_name: pyarrow.Table}
+    // Convert to Python dict (needs GIL for PyArrow)
     let pa = py.import("pyarrow")?;
     let table_cls = pa.getattr("Table")?;
 
@@ -68,30 +108,45 @@ fn read<'py>(py: Python<'py>, path: &str, batch_size: usize, no_chunking: bool) 
 
 /// Return a lazy iterator that yields (type_name, pyarrow.RecordBatch) tuples.
 #[pyfunction]
-#[pyo3(signature = (path, /, batch_size=65536, no_chunking=false))]
-fn read_batches(path: &str, batch_size: usize, no_chunking: bool) -> PyResult<BatchReader> {
-    if batch_size == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "batch_size must be > 0",
-        ));
-    }
+#[pyo3(signature = (path, /, batch_size=65536, no_chunking=false, batch_bytes=None, max_entry_bytes=None, heuristic="all"))]
+fn read_batches(
+    py: Python<'_>,
+    path: String,
+    batch_size: usize,
+    no_chunking: bool,
+    batch_bytes: Option<usize>,
+    max_entry_bytes: Option<usize>,
+    heuristic: &str,
+) -> PyResult<BatchReader> {
+    let config = make_batcher_config(batch_size, batch_bytes, max_entry_bytes, heuristic)?;
 
-    let file = File::open(path).map_err(io_to_py_err)?;
-    let reader = RdbReader::new(file).map_err(rdb_to_py_err)?;
-    let reader = if no_chunking {
-        reader.without_chunking()
-    } else {
-        reader
-    };
-
-    let batcher = ArrowBatcher::new(BatcherConfig { batch_size, ..Default::default() });
-    let batch_iter = batcher.process(reader);
+    // Release GIL during file open + RDB header parsing
+    let batch_iter = py.allow_threads(move || -> Result<_, ThreadError> {
+        let file = File::open(&path).map_err(ThreadError::Io)?;
+        let reader = RdbReader::new(file).map_err(ThreadError::Rdb)?;
+        let reader = if no_chunking {
+            reader.without_chunking()
+        } else {
+            reader
+        };
+        let batcher = ArrowBatcher::new(config);
+        Ok(batcher.process(reader))
+    })?;
 
     Ok(BatchReader {
         inner: Box::new(batch_iter),
     })
 }
 
+/// Python-visible iterator over `(type_name, pyarrow.RecordBatch)` pairs.
+///
+/// `unsendable` at the pyo3 layer forbids Python code from moving this
+/// object between Python threads — each `BatchReader` is pinned to the
+/// thread that constructed it. The inner iterator still needs `Send`
+/// because [`Python::allow_threads`] releases the GIL before calling
+/// `.next()`, and the closure it runs must be `Send`. The two bounds
+/// apply to different layers (Python-side sharing vs. Rust-side GIL
+/// release) and are intentionally both present.
 #[pyclass(unsendable)]
 struct BatchReader {
     inner: Box<dyn Iterator<Item = Result<rdb_to_arrow::TypedBatch, ArrowConvertError>> + Send>,
@@ -104,7 +159,9 @@ impl BatchReader {
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<(String, PyObject)>> {
-        match self.inner.next() {
+        // Release GIL during RDB parsing + Arrow batch construction
+        let result = py.allow_threads(|| self.inner.next());
+        match result {
             Some(Ok(typed_batch)) => {
                 let name = typed_batch.tag.as_str().to_string();
                 let py_batch = typed_batch.batch.to_pyarrow(py)?;
@@ -135,42 +192,37 @@ impl From<ThreadError> for pyo3::PyErr {
 
 /// Export an RDB file directly to Parquet files.
 #[pyfunction]
-#[pyo3(signature = (path, output_dir, /, compression="zstd", batch_size=65536, row_group_size=1048576, no_chunking=false))]
+#[pyo3(signature = (path, output_dir, /, compression="zstd", batch_size=65536, row_group_size=1048576, no_chunking=false, batch_bytes=None, max_entry_bytes=None, heuristic="all"))]
+#[allow(clippy::too_many_arguments)]
 fn to_parquet(
     py: Python<'_>,
-    path: &str,
-    output_dir: &str,
+    // Owned `String` inputs move directly into the `allow_threads`
+    // closure, sparing the prior `path.to_string()` / `output_dir.to_string()`
+    // dance at the entry point.
+    path: String,
+    output_dir: String,
     compression: &str,
     batch_size: usize,
     row_group_size: usize,
     no_chunking: bool,
+    batch_bytes: Option<usize>,
+    max_entry_bytes: Option<usize>,
+    heuristic: &str,
 ) -> PyResult<()> {
-    if batch_size == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "batch_size must be > 0",
-        ));
-    }
+    let batcher_config = make_batcher_config(batch_size, batch_bytes, max_entry_bytes, heuristic)?;
     if row_group_size == 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "row_group_size must be > 0",
         ));
     }
 
-    let compression = match compression.to_ascii_lowercase().as_str() {
-        "zstd" => parquet::basic::Compression::ZSTD(Default::default()),
-        "snappy" => parquet::basic::Compression::SNAPPY,
-        "lz4" => parquet::basic::Compression::LZ4,
-        "gzip" => parquet::basic::Compression::GZIP(Default::default()),
-        "none" => parquet::basic::Compression::UNCOMPRESSED,
-        _ => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown compression: '{compression}'. Valid: zstd, snappy, lz4, gzip, none"
-            )))
-        }
-    };
+    let compression =
+        parse_compression(compression).map_err(pyo3::exceptions::PyValueError::new_err)?;
 
-    let path = path.to_string();
-    let output_dir = output_dir.to_string();
+    // Snapshot the active heuristics before the batcher takes ownership
+    // of the config — `metadata_from_rdb` below bakes them into the
+    // `rdb.heuristics` Parquet tag so `validate` can reparse them.
+    let heuristics_snapshot = batcher_config.heuristics.clone();
 
     py.allow_threads(move || -> Result<(), ThreadError> {
         let file = File::open(&path).map_err(ThreadError::Io)?;
@@ -180,7 +232,7 @@ fn to_parquet(
         } else {
             reader
         };
-        let metadata = metadata_from_rdb(reader.metadata());
+        let metadata = metadata_from_rdb(reader.metadata(), &heuristics_snapshot);
 
         let config = ParquetConfig {
             compression,
@@ -191,7 +243,7 @@ fn to_parquet(
         let output_path = std::path::Path::new(&output_dir);
         std::fs::create_dir_all(output_path).map_err(ThreadError::Io)?;
 
-        let batcher = ArrowBatcher::new(BatcherConfig { batch_size, ..Default::default() });
+        let batcher = ArrowBatcher::new(batcher_config);
         let batches = batcher.process(reader);
 
         let writer_factory = |tag: TypeTag| -> Result<File, ArrowConvertError> {
@@ -208,72 +260,36 @@ fn to_parquet(
 
 /// Inspect an RDB file and return summary statistics as a dict.
 #[pyfunction]
-fn inspect(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let path = path.to_string();
+#[pyo3(signature = (path, /, heuristic="all"))]
+fn inspect(py: Python<'_>, path: String, heuristic: &str) -> PyResult<PyObject> {
+    let heuristics = parse_heuristics(heuristic)?;
 
-    // Do all the I/O without the GIL
-    let (header, metadata, total_keys, db_type_counts, db_key_counts) = py.allow_threads(
-        move || -> Result<_, ThreadError> {
-            let file = File::open(&path).map_err(ThreadError::Io)?;
-            let reader = RdbReader::new(file).map_err(ThreadError::Rdb)?;
+    let summary = py.allow_threads(move || -> Result<_, ThreadError> {
+        let file = File::open(&path).map_err(ThreadError::Io)?;
+        let mut reader = RdbReader::new(file).map_err(ThreadError::Rdb)?;
+        summarize_entries(&mut reader, &heuristics).map_err(ThreadError::Rdb)
+    })?;
 
-            let header = reader.header().clone();
-            let metadata = reader.metadata().clone();
-
-            let mut db_type_counts: BTreeMap<u32, BTreeMap<String, u64>> = BTreeMap::new();
-            let mut db_key_counts: BTreeMap<u32, u64> = BTreeMap::new();
-            let mut total_keys: u64 = 0;
-
-            for entry_result in reader {
-                let entry = match entry_result {
-                    Ok(e) => e,
-                    Err(rdb_parser::RdbError::UnknownType(_)) => continue,
-                    Err(e) => return Err(ThreadError::Rdb(e)),
-                };
-                total_keys += 1;
-                *db_key_counts.entry(entry.db).or_insert(0) += 1;
-                let type_name = match type_tag_for(&entry) {
-                    Some(tag) => tag.as_str().to_string(),
-                    None => entry.type_name().to_string(),
-                };
-                *db_type_counts
-                    .entry(entry.db)
-                    .or_default()
-                    .entry(type_name)
-                    .or_insert(0) += 1;
-
-                // Additive geo counting: if this entry also looks like geo, count it
-                if is_geo_entry(&entry) {
-                    *db_type_counts
-                        .entry(entry.db)
-                        .or_default()
-                        .entry("geo".to_string())
-                        .or_insert(0) += 1;
-                }
-            }
-
-            Ok((header, metadata, total_keys, db_type_counts, db_key_counts))
-        },
-    )?;
-
-    // Build the Python dict (needs the GIL)
     let result = PyDict::new(py);
-    result.set_item("magic", format!("{}", header.magic))?;
-    result.set_item("rdb_version", header.version)?;
+    result.set_item("magic", format!("{}", summary.header.magic))?;
+    result.set_item("rdb_version", summary.header.version)?;
     result.set_item(
         "server_version",
-        metadata.server_version().map(|s| s.to_string()),
+        summary.metadata.server_version().map(|s| s.to_string()),
     )?;
-    result.set_item("total_keys", total_keys)?;
+    result.set_item("total_keys", summary.total_keys)?;
 
     let dbs = PyList::empty(py);
-    for (db, types) in &db_type_counts {
+    for (db, types) in &summary.per_db {
         let db_dict = PyDict::new(py);
         db_dict.set_item("db", db)?;
-        db_dict.set_item("keys", db_key_counts.get(db).copied().unwrap_or(0))?;
+        db_dict.set_item(
+            "keys",
+            summary.per_db_keys.get(db).copied().unwrap_or(0),
+        )?;
         let types_dict = PyDict::new(py);
-        for (type_name, count) in types {
-            types_dict.set_item(type_name.as_str(), count)?;
+        for (tag, count) in types {
+            types_dict.set_item(tag.as_str(), count)?;
         }
         db_dict.set_item("types", types_dict)?;
         dbs.append(db_dict)?;
@@ -281,10 +297,6 @@ fn inspect(py: Python<'_>, path: &str) -> PyResult<PyObject> {
     result.set_item("dbs", dbs)?;
 
     Ok(result.into())
-}
-
-fn io_to_py_err(e: std::io::Error) -> pyo3::PyErr {
-    pyo3::exceptions::PyOSError::new_err(e.to_string())
 }
 
 fn rdb_to_py_err(e: rdb_parser::RdbError) -> pyo3::PyErr {

@@ -11,7 +11,8 @@ use rdb_parser::RdbReader;
 use rdb_to_arrow::*;
 
 let reader = RdbReader::new(BufReader::new(File::open("dump.rdb").unwrap())).unwrap();
-let metadata = metadata_from_rdb(reader.metadata());
+let heuristics: std::collections::HashSet<Heuristic> = Heuristic::ALL.iter().copied().collect();
+let metadata = metadata_from_rdb(reader.metadata(), &heuristics);
 
 let batcher = ArrowBatcher::new(BatcherConfig::default());
 let batches = batcher.process(reader);

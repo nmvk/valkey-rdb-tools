@@ -5,7 +5,13 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, RecordBatch};
 use rdb_parser::RdbReader;
-use rdb_to_arrow::{ArrowBatcher, BatcherConfig, TypeTag, metadata_from_rdb};
+use rdb_to_arrow::{ArrowBatcher, BatcherConfig, Heuristic, TypeTag, metadata_from_rdb};
+
+/// Heuristic set used for fixture roundtrip assertions: all built-in
+/// heuristics enabled, matching the CLI's default.
+fn all_heuristics() -> std::collections::HashSet<Heuristic> {
+    Heuristic::ALL.iter().copied().collect()
+}
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -84,12 +90,16 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 fn basic_rdb_to_parquet_roundtrip() {
     let (by_type, meta) = collect_batches(&fixture_path("basic.rdb"));
 
-    let file_meta = metadata_from_rdb(&meta);
+    let heuristics = all_heuristics();
+    let file_meta = metadata_from_rdb(&meta, &heuristics);
     assert!(
         file_meta.contains_key("rdb.valkey-ver") || file_meta.contains_key("rdb.redis-ver"),
         "should contain server version"
     );
     assert_eq!(file_meta["rdb.exported_by"], "valkey-rdb-tools");
+    // rdb.heuristics is written as the canonical format_set string and
+    // must be present so `validate` can reparse it.
+    assert_eq!(file_meta["rdb.heuristics"], Heuristic::format_set(&heuristics));
 
     // --- String: mystring + expiring_key = 2 rows ---
     let string_batches = by_type.get(&TypeTag::String).expect("should have strings");
@@ -104,6 +114,12 @@ fn basic_rdb_to_parquet_roundtrip() {
     assert!(
         pq_meta.contains_key("rdb.valkey-ver") || pq_meta.contains_key("rdb.redis-ver"),
         "server version should roundtrip through Parquet"
+    );
+    // `rdb.heuristics` must survive through Parquet, otherwise `validate`
+    // has no way to know which heuristic set produced the file.
+    assert_eq!(
+        pq_meta.get("rdb.heuristics").map(|s| s.as_str()),
+        Some(Heuristic::format_set(&heuristics).as_str())
     );
 
     // --- List: mylist [a, b, c] = 3 rows ---
@@ -140,6 +156,31 @@ fn basic_rdb_to_parquet_roundtrip() {
     // No Geo or HLL in basic.rdb.
     assert!(!by_type.contains_key(&TypeTag::Geo));
     assert!(!by_type.contains_key(&TypeTag::HyperLogLog));
+}
+
+/// Empty heuristic set must round-trip as `"none"` — and `parse_set` on
+/// that string must return the same empty set. Pins the
+/// format_set / parse_set inverse property that `validate` relies on.
+#[test]
+fn heuristics_empty_set_roundtrips_as_none() {
+    let (_, meta) = collect_batches(&fixture_path("basic.rdb"));
+    let empty = std::collections::HashSet::new();
+    let file_meta = metadata_from_rdb(&meta, &empty);
+    assert_eq!(file_meta["rdb.heuristics"], "none");
+    let parsed = Heuristic::parse_set(&file_meta["rdb.heuristics"]).unwrap();
+    assert!(parsed.is_empty());
+}
+
+/// Recorded `rdb.heuristics` value must parse back into the exact same
+/// set that was written. Any change to `format_set` or `parse_set` that
+/// breaks this invariant silently breaks `validate`.
+#[test]
+fn heuristics_all_set_roundtrips() {
+    let (_, meta) = collect_batches(&fixture_path("basic.rdb"));
+    let heuristics = all_heuristics();
+    let file_meta = metadata_from_rdb(&meta, &heuristics);
+    let parsed = Heuristic::parse_set(&file_meta["rdb.heuristics"]).unwrap();
+    assert_eq!(parsed, heuristics);
 }
 
 /// Verify that key values survive the roundtrip.
@@ -210,7 +251,7 @@ fn multi_db_roundtrip() {
 #[test]
 fn hash_field_ttl_roundtrip() {
     let (by_type, meta) = collect_batches(&fixture_path("hash_field_ttl.rdb"));
-    let file_meta = metadata_from_rdb(&meta);
+    let file_meta = metadata_from_rdb(&meta, &all_heuristics());
 
     let hash_batches = by_type.get(&TypeTag::Hash).expect("should have hashes");
     // hfe_hash (3 fields) + normal_hash (2 fields) = 5 rows
