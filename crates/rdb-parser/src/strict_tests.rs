@@ -106,7 +106,7 @@ fn strict_snapshot_total_stream_can_exceed_live_allocation_budget() {
     bound.work = 1_000_000;
     let mut reader = RdbReader::new_limited(Cursor::new(bytes), bound).unwrap();
     let mut count = 0;
-    while let Some(entry) = reader.next() {
+    for entry in reader.by_ref() {
         drop(entry.unwrap());
         count += 1;
     }
