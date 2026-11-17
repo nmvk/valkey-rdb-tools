@@ -5,8 +5,10 @@
 use std::io::{BufReader, Read};
 
 use crate::crc64;
+use crate::limits::{self, Limits};
 use crate::opcodes::*;
 use crate::types::*;
+use crate::wipe::{Zeroize, Zeroizing};
 use crate::CAPACITY_HINT_MAX;
 
 // Module serialized value sub-opcodes (from rdb.h)
@@ -62,6 +64,7 @@ enum LenResult {
 /// A Read wrapper that accumulates CRC-64 over all bytes read.
 struct CrcReader<R: Read> {
     inner: BufReader<R>,
+    remaining: Option<(u64, u64)>,
     crc: u64,
 }
 
@@ -70,13 +73,30 @@ impl<R: Read> CrcReader<R> {
         Self {
             inner,
             crc: initial_crc,
+            remaining: None,
         }
     }
 }
 
 impl<R: Read> Read for CrcReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
+        let allowed = if let Some((bytes, work)) = self.remaining {
+            let allowed = bytes.min(work).min(buf.len() as u64) as usize;
+            if allowed == 0 && !buf.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "snapshot input/work bound",
+                ));
+            }
+            allowed
+        } else {
+            buf.len()
+        };
+        let n = self.inner.read(&mut buf[..allowed])?;
+        if let Some((bytes, work)) = &mut self.remaining {
+            *bytes -= n as u64;
+            *work -= n as u64;
+        }
         self.crc = crc64::crc64(self.crc, &buf[..n]);
         Ok(n)
     }
@@ -125,6 +145,8 @@ pub struct RdbReader<R: Read> {
     chunked: Option<ChunkedState>,
     /// Set to true when the CRC-64 checksum was actually validated at EOF.
     crc_checked: bool,
+    strict: Option<Limits>,
+    entry_limits: Option<(u64, u64)>,
 }
 
 impl<R: Read> RdbReader<R> {
@@ -132,7 +154,38 @@ impl<R: Read> RdbReader<R> {
     /// consumes all AUX fields up to the first database section or EOF.
     /// After `new()` returns, [`metadata()`](Self::metadata) is fully populated.
     pub fn new(reader: R) -> Result<Self, RdbError> {
+        Self::construct(reader, None)
+    }
+
+    /// Admit a strict native snapshot with bounds installed before eager AUX parsing.
+    /// Unsupported functions, modules, streams, slot sections and hash-field TTLs
+    /// are terminal. Raw AUX bytes retain order and duplicates (in this mode
+    /// [`metadata().aux`](Self::metadata) is not populated; use `raw_aux`).
+    ///
+    /// Input is read through an internal buffer, so the underlying source may be read up to
+    /// 8 KiB beyond `input_bytes` even though the parse itself never consumes more.
+    pub fn new_limited(reader: R, limits: Limits) -> Result<Self, RdbError> {
+        if [
+            limits.input_bytes,
+            limits.allocated_bytes,
+            limits.metadata_bytes,
+            limits.string_bytes,
+            limits.elements,
+            limits.work,
+        ]
+        .contains(&0)
+        {
+            return Err(RdbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "strict limits must all be greater than zero",
+            )));
+        }
+        Self::construct(reader, Some(limits))
+    }
+
+    fn construct(reader: R, strict: Option<Limits>) -> Result<Self, RdbError> {
         let mut reader = CrcReader::new(BufReader::new(reader), 0);
+        reader.remaining = strict.map(|v| (v.input_bytes, v.work));
         let header = read_header(&mut reader)?;
         let mut rdr = Self {
             reader,
@@ -146,10 +199,21 @@ impl<R: Read> RdbReader<R> {
             finished: false,
             max_key_elements: Some(DEFAULT_MAX_KEY_ELEMENTS),
             crc_checked: false,
+            entry_limits: strict.map(|v| (v.allocated_bytes, v.elements)),
+            strict,
             chunked: None,
         };
         rdr.read_preamble()?;
         Ok(rdr)
+    }
+
+    /// Recover the caller-owned reader.
+    ///
+    /// After a strict parse that reached EOF successfully, the internal buffer is empty and
+    /// the reader is positioned at end of input. After an error or an early stop, up to
+    /// 8 KiB of read-ahead held in the internal buffer is discarded.
+    pub fn into_inner(self) -> R {
+        self.reader.inner.into_inner()
     }
 
     /// The parsed RDB header.
@@ -216,9 +280,83 @@ impl<R: Read> RdbReader<R> {
     }
 
     fn read_exact_vec(&mut self, len: usize) -> Result<Vec<u8>, RdbError> {
-        let mut buf = vec![0u8; len];
+        self.charge_bytes(len)?;
+        let mut buf = Zeroizing::new(limits::vector(len)?);
+        buf.resize(len, 0);
         self.reader.read_exact(&mut buf)?;
-        Ok(buf)
+        Ok(std::mem::take(&mut *buf))
+    }
+
+    fn charge_bytes(&mut self, count: usize) -> Result<(), RdbError> {
+        if let Some(limits) = &mut self.strict {
+            if count as u64 > limits.string_bytes {
+                return Err(limits::refused());
+            }
+            limits::debit(&mut limits.allocated_bytes, count as u64)?;
+        }
+        Ok(())
+    }
+
+    fn charge_elements(&mut self, count: usize) -> Result<(), RdbError> {
+        if let Some(limits) = &mut self.strict {
+            limits::debit(&mut limits.elements, count as u64)?;
+            // Includes output vectors, temporary compact entries and conversion.
+            limits::debit(
+                &mut limits.allocated_bytes,
+                (count as u64)
+                    .checked_mul(128)
+                    .ok_or_else(limits::refused)?,
+            )?;
+        }
+        if let Some((_, work)) = &mut self.reader.remaining {
+            limits::debit(work, count as u64)?;
+        }
+        Ok(())
+    }
+
+    fn compact(
+        &mut self,
+        bytes: &[u8],
+        listpack: bool,
+    ) -> Result<Vec<crate::compact::CompactEntry>, RdbError> {
+        self.charge_elements(bytes.len())?;
+        if listpack {
+            crate::listpack::decode(bytes)
+        } else {
+            crate::ziplist::decode(bytes)
+        }
+    }
+
+    fn zset_compact(
+        &self,
+        entries: Vec<crate::compact::CompactEntry>,
+        ctx: &str,
+    ) -> Result<RdbValue, RdbError> {
+        if self.strict.is_none() {
+            return Ok(RdbValue::SortedSet(decode_zset_pairs(entries, ctx)?));
+        }
+        if entries.len() % 2 != 0 {
+            return Err(RdbError::CorruptData(format!(
+                "{ctx} has odd number of entries"
+            )));
+        }
+        let mut out = Zeroizing::new(limits::vector(entries.len() / 2)?);
+        let mut entries = entries.into_iter();
+        while let Some(member) = entries.next() {
+            let score = entries.next().ok_or_else(|| {
+                RdbError::CorruptData(format!("{ctx}: missing score for member"))
+            })?;
+            score.to_f64()?;
+            out.push((member.into_bytes(), score.into_bytes()));
+        }
+        Ok(RdbValue::SortedSetBytes(std::mem::take(&mut *out)))
+    }
+
+    /// Like the iterator's `next`, but the decoded entry is wiped when dropped, on success
+    /// as well as on error or cancellation. Requires the `zeroize` feature.
+    #[cfg(feature = "zeroize")]
+    pub fn next_protected(&mut self) -> Option<Result<Zeroizing<RdbEntry>, RdbError>> {
+        self.next().map(|entry| entry.map(Zeroizing::new))
     }
 
     /// Safely convert a u64 length to usize, rejecting values that would
@@ -327,7 +465,11 @@ impl<R: Read> RdbReader<R> {
                         self.read_length_value()?,
                         "LZF uncompressed length",
                     )?;
-                    let compressed = self.read_exact_vec(compressed_len)?;
+                    self.charge_bytes(uncompressed_len)?;
+                    if let Some((_, work)) = &mut self.reader.remaining {
+                        limits::debit(work, uncompressed_len as u64)?;
+                    }
+                    let compressed = Zeroizing::new(self.read_exact_vec(compressed_len)?);
                     let decompressed = crate::lzf::decompress(&compressed, uncompressed_len)?;
                     Ok(decompressed)
                 }
@@ -349,7 +491,7 @@ impl<R: Read> RdbReader<R> {
             254 => Ok(f64::INFINITY),
             253 => Ok(f64::NAN),
             n => {
-                let buf = self.read_exact_vec(n as usize)?;
+                let buf = Zeroizing::new(self.read_exact_vec(n as usize)?);
                 let s = std::str::from_utf8(&buf).map_err(|_| {
                     RdbError::CorruptData("invalid UTF-8 in double value".into())
                 })?;
@@ -464,8 +606,24 @@ impl<R: Read> RdbReader<R> {
     /// Stores the first non-AUX byte in `preamble_byte` for replay.
     /// Read one AUX field (key + value strings) and insert into metadata.
     fn read_aux_field(&mut self) -> Result<(), RdbError> {
-        let key = self.read_string()?;
-        let value = self.read_string()?;
+        let mut key = Zeroizing::new(self.read_string()?);
+        let mut value = Zeroizing::new(self.read_string()?);
+        if let Some(limits) = &mut self.strict {
+            limits::debit(
+                &mut limits.metadata_bytes,
+                (key.len() as u64)
+                    .checked_add(value.len() as u64)
+                    .and_then(|v| v.checked_add(48))
+                    .ok_or_else(limits::refused)?,
+            )?;
+            limits::push(
+                &mut self.metadata.raw_aux,
+                (std::mem::take(&mut *key), std::mem::take(&mut *value)),
+            )?;
+            return Ok(());
+        }
+        let key = std::mem::take(&mut *key);
+        let value = std::mem::take(&mut *value);
         // AUX keys must be valid UTF-8 (they're server-defined ASCII names
         // like "redis-ver", "ctime", etc.). Reject non-UTF-8 to avoid
         // lossy conversion collisions in the metadata map.
@@ -500,7 +658,7 @@ impl<R: Read> RdbReader<R> {
         let lru_idle_secs = self.pending_lru_idle.take();
         let lfu_frequency = self.pending_lfu_freq.take();
 
-        let key = self.read_string()?;
+        let mut key = Zeroizing::new(self.read_string()?);
 
         // Check if this is a chunkable plain type that exceeds the threshold.
         // Both branches below return early — the fallthrough to read_value() at
@@ -516,7 +674,13 @@ impl<R: Read> RdbReader<R> {
                     if remaining > 0 {
                         self.chunked = Some(ChunkedState {
                             db: self.current_db,
-                            key: key.clone(),
+                            key: {
+                                self.charge_bytes(key.len())?;
+                                if let Some((_, work)) = &mut self.reader.remaining {
+                                    limits::debit(work, key.len() as u64)?;
+                                }
+                                limits::copy(&key)?
+                            },
                             type_code,
                             expiry_ms,
                             lru_idle_secs,
@@ -528,7 +692,7 @@ impl<R: Read> RdbReader<R> {
                     }
                     return Ok(RdbEntry {
                         db: self.current_db,
-                        key,
+                        key: std::mem::take(&mut *key),
                         value,
                         type_code,
                         expiry_ms,
@@ -542,7 +706,7 @@ impl<R: Read> RdbReader<R> {
                 let value = self.read_n_elements(type_code, count)?;
                 return Ok(RdbEntry {
                     db: self.current_db,
-                    key,
+                    key: std::mem::take(&mut *key),
                     value,
                     type_code,
                     expiry_ms,
@@ -558,7 +722,7 @@ impl<R: Read> RdbReader<R> {
         let value = self.read_value(type_code)?;
         Ok(RdbEntry {
             db: self.current_db,
-            key,
+            key: std::mem::take(&mut *key),
             value,
             type_code,
             expiry_ms,
@@ -581,47 +745,48 @@ impl<R: Read> RdbReader<R> {
 
             // --- Listpack-encoded types ---
             RDB_TYPE_SET_LISTPACK => {
-                let blob = self.read_string()?;
-                let entries = crate::listpack::decode(&blob)?;
-                let members = entries.into_iter().map(|e| e.into_bytes()).collect();
+                let blob = Zeroizing::new(self.read_string()?);
+                let entries = self.compact(&blob, true)?;
+                let members = compact_bytes(entries)?;
                 Ok(RdbValue::Set(members))
             }
 
             RDB_TYPE_HASH_LISTPACK => {
-                let blob = self.read_string()?;
-                let entries = crate::listpack::decode(&blob)?;
+                let blob = Zeroizing::new(self.read_string()?);
+                let entries = self.compact(&blob, true)?;
                 Ok(RdbValue::Hash(decode_hash_pairs(entries, "hash listpack")?))
             }
 
             RDB_TYPE_ZSET_LISTPACK => {
-                let blob = self.read_string()?;
-                let entries = crate::listpack::decode(&blob)?;
-                Ok(RdbValue::SortedSet(decode_zset_pairs(entries, "zset listpack")?))
+                let blob = Zeroizing::new(self.read_string()?);
+                let entries = self.compact(&blob, true)?;
+                self.zset_compact(entries, "zset listpack")
             }
 
             // --- Ziplist-encoded types ---
             RDB_TYPE_LIST_ZIPLIST => {
-                let blob = self.read_string()?;
-                let entries = crate::ziplist::decode(&blob)?;
-                let elements = entries.into_iter().map(|e| e.into_bytes()).collect();
+                let blob = Zeroizing::new(self.read_string()?);
+                let entries = self.compact(&blob, false)?;
+                let elements = compact_bytes(entries)?;
                 Ok(RdbValue::List(elements))
             }
 
             RDB_TYPE_HASH_ZIPLIST => {
-                let blob = self.read_string()?;
-                let entries = crate::ziplist::decode(&blob)?;
+                let blob = Zeroizing::new(self.read_string()?);
+                let entries = self.compact(&blob, false)?;
                 Ok(RdbValue::Hash(decode_hash_pairs(entries, "hash ziplist")?))
             }
 
             RDB_TYPE_ZSET_ZIPLIST => {
-                let blob = self.read_string()?;
-                let entries = crate::ziplist::decode(&blob)?;
-                Ok(RdbValue::SortedSet(decode_zset_pairs(entries, "zset ziplist")?))
+                let blob = Zeroizing::new(self.read_string()?);
+                let entries = self.compact(&blob, false)?;
+                self.zset_compact(entries, "zset ziplist")
             }
 
             // --- Intset: sorted integer set as a single blob ---
             RDB_TYPE_SET_INTSET => {
-                let blob = self.read_string()?;
+                let blob = Zeroizing::new(self.read_string()?);
+                self.charge_elements(blob.len())?;
                 let members = crate::intset::decode(&blob)?;
                 Ok(RdbValue::Set(members))
             }
@@ -643,15 +808,16 @@ impl<R: Read> RdbReader<R> {
             RDB_TYPE_LIST_QUICKLIST => {
                 let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
                 // count is node count, not element count; cap initial capacity
-                let mut elements = Vec::with_capacity(count.min(1024));
+                self.charge_elements(count)?;
+                let mut elements = Zeroizing::new(limits::vector(count.min(1024))?);
                 for _ in 0..count {
-                    let node = self.read_string()?;
-                    let entries = crate::ziplist::decode(&node)?;
+                    let node = Zeroizing::new(self.read_string()?);
+                    let entries = self.compact(&node, false)?;
                     for entry in entries {
-                        elements.push(entry.into_bytes());
+                        limits::push(&mut elements, entry.into_bytes())?;
                     }
                 }
-                Ok(RdbValue::List(elements))
+                Ok(RdbValue::List(std::mem::take(&mut *elements)))
             }
 
             // --- Quicklist v2: N (container_type, node_blob) pairs ---
@@ -659,20 +825,21 @@ impl<R: Read> RdbReader<R> {
             RDB_TYPE_LIST_QUICKLIST_2 => {
                 let count = Self::len_to_usize(self.read_length_value()?, "element count")?;
                 // count is node count, not element count; cap initial capacity
-                let mut elements = Vec::with_capacity(count.min(1024));
+                self.charge_elements(count)?;
+                let mut elements = Zeroizing::new(limits::vector(count.min(1024))?);
                 for _ in 0..count {
                     let container = self.read_length_value()?;
-                    let node = self.read_string()?;
+                    let mut node = Zeroizing::new(self.read_string()?);
                     match container {
                         1 => {
                             // PLAIN: the blob is a single raw element
-                            elements.push(node);
+                            limits::push(&mut elements, std::mem::take(&mut *node))?;
                         }
                         2 => {
                             // PACKED: the blob is a listpack
-                            let entries = crate::listpack::decode(&node)?;
+                            let entries = self.compact(&node, true)?;
                             for entry in entries {
-                                elements.push(entry.into_bytes());
+                                limits::push(&mut elements, entry.into_bytes())?;
                             }
                         }
                         _ => {
@@ -683,7 +850,7 @@ impl<R: Read> RdbReader<R> {
                         }
                     }
                 }
-                Ok(RdbValue::List(elements))
+                Ok(RdbValue::List(std::mem::take(&mut *elements)))
             }
 
             // --- Stream types: decode listpacks into stream entries ---
@@ -849,68 +1016,88 @@ impl<R: Read> RdbReader<R> {
     /// Read exactly `n` elements for a plain-encoded type, returning the
     /// appropriate `RdbValue`.
     fn read_n_elements(&mut self, type_code: u8, n: usize) -> Result<RdbValue, RdbError> {
+        self.charge_elements(n)?;
         let cap = n.min(CAPACITY_HINT_MAX);
+        if self.strict.is_some() && matches!(type_code, RDB_TYPE_ZSET | RDB_TYPE_ZSET_2) {
+            let mut out = Zeroizing::new(limits::vector(n)?);
+            for _ in 0..n {
+                let mut member = Zeroizing::new(self.read_string()?);
+                let score = if type_code == RDB_TYPE_ZSET_2 {
+                    self.read_exact_vec(8)?
+                } else {
+                    let length = self.read_u8()?;
+                    match length {
+                        253 => limits::copy(b"nan")?,
+                        254 => limits::copy(b"+inf")?,
+                        255 => limits::copy(b"-inf")?,
+                        length => self.read_exact_vec(length as usize)?,
+                    }
+                };
+                out.push((std::mem::take(&mut *member), score));
+            }
+            return Ok(RdbValue::SortedSetBytes(std::mem::take(&mut *out)));
+        }
         match type_code {
             RDB_TYPE_LIST => {
-                let mut elements = Vec::with_capacity(cap);
+                let mut elements = Zeroizing::new(limits::vector(cap)?);
                 for _ in 0..n {
                     elements.push(self.read_string()?);
                 }
-                Ok(RdbValue::List(elements))
+                Ok(RdbValue::List(std::mem::take(&mut *elements)))
             }
             RDB_TYPE_SET => {
-                let mut members = Vec::with_capacity(cap);
+                let mut members = Zeroizing::new(limits::vector(cap)?);
                 for _ in 0..n {
                     members.push(self.read_string()?);
                 }
-                Ok(RdbValue::Set(members))
+                Ok(RdbValue::Set(std::mem::take(&mut *members)))
             }
             RDB_TYPE_ZSET => {
-                let mut pairs = Vec::with_capacity(cap);
+                let mut pairs = Zeroizing::new(limits::vector(cap)?);
                 for _ in 0..n {
-                    let member = self.read_string()?;
+                    let mut member = Zeroizing::new(self.read_string()?);
                     let score = self.read_double_value()?;
-                    pairs.push((member, score));
+                    pairs.push((std::mem::take(&mut *member), score));
                 }
-                Ok(RdbValue::SortedSet(pairs))
+                Ok(RdbValue::SortedSet(std::mem::take(&mut *pairs)))
             }
             RDB_TYPE_HASH => {
-                let mut fields = Vec::with_capacity(cap);
+                let mut fields = Zeroizing::new(limits::vector(cap)?);
                 for _ in 0..n {
-                    let field = self.read_string()?;
-                    let value = self.read_string()?;
+                    let mut field = Zeroizing::new(self.read_string()?);
+                    let mut value = Zeroizing::new(self.read_string()?);
                     fields.push(HashField {
-                        field,
-                        value,
+                        field: std::mem::take(&mut *field),
+                        value: std::mem::take(&mut *value),
                         expiry_ms: None,
                     });
                 }
-                Ok(RdbValue::Hash(fields))
+                Ok(RdbValue::Hash(std::mem::take(&mut *fields)))
             }
             RDB_TYPE_ZSET_2 => {
-                let mut pairs = Vec::with_capacity(cap);
+                let mut pairs = Zeroizing::new(limits::vector(cap)?);
                 for _ in 0..n {
-                    let member = self.read_string()?;
+                    let mut member = Zeroizing::new(self.read_string()?);
                     let mut score_buf = [0u8; 8];
                     self.reader.read_exact(&mut score_buf)?;
                     let score = f64::from_le_bytes(score_buf);
-                    pairs.push((member, score));
+                    pairs.push((std::mem::take(&mut *member), score));
                 }
-                Ok(RdbValue::SortedSet(pairs))
+                Ok(RdbValue::SortedSet(std::mem::take(&mut *pairs)))
             }
             RDB_TYPE_HASH_2 => {
-                let mut fields = Vec::with_capacity(cap);
+                let mut fields = Zeroizing::new(limits::vector(cap)?);
                 for _ in 0..n {
-                    let field = self.read_string()?;
-                    let value = self.read_string()?;
+                    let mut field = Zeroizing::new(self.read_string()?);
+                    let mut value = Zeroizing::new(self.read_string()?);
                     let ttl = self.read_i64_le()?;
                     fields.push(HashField {
-                        field,
-                        value,
+                        field: std::mem::take(&mut *field),
+                        value: std::mem::take(&mut *value),
                         expiry_ms: if ttl == -1 { None } else { Some(ttl) },
                     });
                 }
-                Ok(RdbValue::Hash(fields))
+                Ok(RdbValue::Hash(std::mem::take(&mut *fields)))
             }
             _ => Err(RdbError::CorruptData(format!(
                 "read_n_elements called with non-plain type code {}",
@@ -933,7 +1120,13 @@ impl<R: Read> RdbReader<R> {
         // Extract what we need before the mutable borrow in read_n_elements
         let type_code = state.type_code;
         let db = state.db;
-        let key = state.key.clone();
+        if let Some(limits) = &mut self.strict {
+            limits::debit(&mut limits.allocated_bytes, state.key.len() as u64)?;
+        }
+        if let Some((_, work)) = &mut self.reader.remaining {
+            limits::debit(work, state.key.len() as u64)?;
+        }
+        let mut key = Zeroizing::new(limits::copy(&state.key)?);
         let expiry_ms = state.expiry_ms;
         let lru_idle_secs = state.lru_idle_secs;
         let lfu_frequency = state.lfu_frequency;
@@ -952,7 +1145,7 @@ impl<R: Read> RdbReader<R> {
 
         Ok(RdbEntry {
             db,
-            key,
+            key: std::mem::take(&mut *key),
             value,
             type_code,
             expiry_ms,
@@ -977,6 +1170,18 @@ impl<R: Read> Iterator for RdbReader<R> {
     type Item = Result<RdbEntry, RdbError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let (Some(limits), Some((allocated, elements))) = (&mut self.strict, self.entry_limits) {
+            // Prior outputs are owned by the caller. The parser retains only
+            // bounded AUX plus one chunk key between iterator calls.
+            limits.allocated_bytes = allocated;
+            limits.elements = elements;
+            if let Some(chunk) = &self.chunked {
+                if limits::debit(&mut limits.allocated_bytes, chunk.key.len() as u64).is_err() {
+                    self.finished = true;
+                    return Some(Err(RdbError::ResourceLimit));
+                }
+            }
+        }
         if self.finished {
             return None;
         }
@@ -985,7 +1190,12 @@ impl<R: Read> Iterator for RdbReader<R> {
             // Normal entry or EOF
             Ok(entry) => entry.map(Ok),
             // UnknownType after consuming bytes: recoverable, iterator continues
-            Err(RdbError::UnknownType(t)) => Some(Err(RdbError::UnknownType(t))),
+            Err(RdbError::UnknownType(t)) => {
+                if self.strict.is_some() {
+                    self.finished = true;
+                }
+                Some(Err(RdbError::UnknownType(t)))
+            }
             // All other errors are terminal
             Err(e) => {
                 self.finished = true;
@@ -1012,6 +1222,14 @@ impl<R: Read> RdbReader<R> {
                 self.read_u8()?
             };
 
+            if self.strict.is_some()
+                && !matches!(byte,
+                RDB_OPCODE_AUX | RDB_OPCODE_SELECTDB | RDB_OPCODE_RESIZEDB |
+                RDB_OPCODE_EXPIRETIME_MS | RDB_OPCODE_EXPIRETIME | RDB_OPCODE_IDLE |
+                RDB_OPCODE_FREQ | RDB_OPCODE_EOF | 0..=5 | 10..=14 | 16..=18 | 20)
+            {
+                return Err(RdbError::UnsupportedProfile(byte));
+            }
             match byte {
                 RDB_OPCODE_AUX => {
                     self.read_aux_field()?;
@@ -1066,8 +1284,9 @@ impl<R: Read> RdbReader<R> {
 
                     // Read the 8-byte LE CRC64 trailer (not included in CRC)
                     let mut crc_buf = [0u8; 8];
-                    // Read directly from inner to avoid including trailer in CRC
-                    self.reader.inner.read_exact(&mut crc_buf)?;
+                    // Read through the bounded reader so the trailer counts toward the
+                    // strict input limit (the CRC was already captured above).
+                    self.reader.read_exact(&mut crc_buf)?;
                     let stored_crc = u64::from_le_bytes(crc_buf);
 
                     // Validate if version >= 5 and stored checksum is non-zero
@@ -1082,6 +1301,16 @@ impl<R: Read> RdbReader<R> {
                         self.crc_checked = true;
                     }
 
+                    if self.strict.is_some() {
+                        let mut trailing = [0u8; 1];
+                        // The upstream source must be an exact bounded immutable snapshot.
+                        if self.reader.inner.read(&mut trailing)? != 0 {
+                            trailing.zeroize();
+                            return Err(RdbError::CorruptData(
+                                "trailing bytes after EOF".into(),
+                            ));
+                        }
+                    }
                     self.finished = true;
                     return Ok(None);
                 }
@@ -1147,7 +1376,7 @@ fn decode_hash_pairs(
             "{ctx} has odd number of entries"
         )));
     }
-    let mut fields = Vec::with_capacity(entries.len() / 2);
+    let mut fields = Zeroizing::new(limits::vector(entries.len() / 2)?);
     let mut iter = entries.into_iter();
     while let Some(field) = iter.next() {
         let value = iter.next().ok_or_else(|| {
@@ -1159,7 +1388,7 @@ fn decode_hash_pairs(
             expiry_ms: None,
         });
     }
-    Ok(fields)
+    Ok(std::mem::take(&mut *fields))
 }
 
 /// Decode compact entries (listpack or ziplist) as sorted set member-score pairs.
@@ -1172,7 +1401,7 @@ fn decode_zset_pairs(
             "{ctx} has odd number of entries"
         )));
     }
-    let mut pairs = Vec::with_capacity(entries.len() / 2);
+    let mut pairs = Zeroizing::new(limits::vector(entries.len() / 2)?);
     let mut iter = entries.into_iter();
     while let Some(member) = iter.next() {
         let score_entry = iter.next().ok_or_else(|| {
@@ -1181,7 +1410,7 @@ fn decode_zset_pairs(
         let score = score_entry.to_f64()?;
         pairs.push((member.into_bytes(), score));
     }
-    Ok(pairs)
+    Ok(std::mem::take(&mut *pairs))
 }
 
 /// Format (from valkey/src/rdb.c rdbLoadRioWithLoadingCtx):
@@ -1220,6 +1449,20 @@ fn read_header(reader: &mut impl Read) -> Result<RdbHeader, RdbError> {
     }
 
     Ok(RdbHeader { magic, version })
+}
+
+fn compact_bytes(entries: Vec<crate::compact::CompactEntry>) -> Result<Vec<Vec<u8>>, RdbError> {
+    let mut out = Zeroizing::new(limits::vector(entries.len())?);
+    for entry in entries {
+        out.push(entry.into_bytes());
+    }
+    Ok(std::mem::take(&mut *out))
+}
+
+impl Drop for ChunkedState {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 

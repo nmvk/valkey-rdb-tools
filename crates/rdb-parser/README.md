@@ -36,7 +36,7 @@ Module data is fully parsed into typed values. Streams are fully decoded includi
 
 ## Design
 
-- Zero external dependencies — embeddable anywhere
+- Zero external dependencies by default — embeddable anywhere. The optional `zeroize` feature adds the `zeroize` crate (>=1.8, <1.9) to wipe parsed buffers on drop and exposes `RdbReader::next_protected`. Note: with the feature `RdbMetadata` implements `Drop`, so code that moves a field out of it (for example `meta.aux`) no longer compiles
 - Streaming — reads entries one at a time, never buffers the whole file
 - 512MB allocation cap protects against crafted inputs
 

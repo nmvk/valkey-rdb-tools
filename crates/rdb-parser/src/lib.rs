@@ -17,8 +17,10 @@
 pub(crate) mod compact;
 pub(crate) mod crc64;
 pub(crate) mod intset;
+pub mod limits;
 pub(crate) mod listpack;
 pub(crate) mod lzf;
+pub use limits::Limits;
 /// RDB wire-format constants: opcode bytes, type codes, and helpers
 /// for classifying them (`is_object_type`, `type_name`, `encoding_name`).
 /// Exposed for downstream tools that need to construct or inspect raw
@@ -29,6 +31,7 @@ pub mod reader;
 pub(crate) mod stream;
 /// Typed data structures yielded by the reader: entries, values, metadata.
 pub mod types;
+pub(crate) mod wipe;
 pub(crate) mod ziplist;
 
 pub use reader::{RdbReader, DEFAULT_MAX_KEY_ELEMENTS};
@@ -39,3 +42,6 @@ pub use types::{HashField, ModuleData, ModuleValue, RdbEntry, RdbError, RdbHeade
 /// cap — it only limits the initial allocation so a crafted count field
 /// cannot force a multi-GB reservation.
 pub(crate) const CAPACITY_HINT_MAX: usize = 65_536;
+
+#[cfg(test)]
+mod strict_tests;

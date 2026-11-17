@@ -8,3 +8,9 @@ repository.workspace = true
 description = "Parse Valkey/Redis RDB files into typed entries"
 
 [dependencies]
+# Optional. Kept below 1.9, whose MSRV (1.85) exceeds this workspace's `rust-version`.
+zeroize = { version = "~1.8", optional = true }
+
+[features]
+# Wipe parsed buffers when dropped and implement `Zeroize` for the parsed types.
+zeroize = ["dep:zeroize"]

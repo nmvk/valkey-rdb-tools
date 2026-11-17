@@ -10,7 +10,9 @@
 //   2 = int16, 4 = int32, 8 = int64
 // All integers are little-endian and signed.
 
+use crate::limits;
 use crate::types::RdbError;
+use crate::wipe::Zeroizing;
 
 const INTSET_HDR_SIZE: usize = 8;
 const INTSET_ENC_INT16: u32 = 2;
@@ -65,7 +67,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, RdbError> {
         )));
     }
 
-    let mut members = Vec::with_capacity(length);
+    let mut members = Zeroizing::new(limits::vector(length)?);
     let mut pos = INTSET_HDR_SIZE;
 
     for _ in 0..length {
@@ -97,7 +99,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, RdbError> {
         })?;
     }
 
-    Ok(members)
+    Ok(std::mem::take(&mut *members))
 }
 
 #[cfg(test)]

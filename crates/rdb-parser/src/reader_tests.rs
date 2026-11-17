@@ -1246,5 +1246,7 @@ fn make_test_reader(data: &[u8]) -> RdbReader<Cursor<Vec<u8>>> {
         max_key_elements: None,
         chunked: None,
         crc_checked: false,
+        strict: None,
+        entry_limits: None,
     }
 }

@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(feature = "zeroize")]
+use zeroize::Zeroize;
 
 /// RDB magic string type — REDIS (legacy) or VALKEY (9.0+).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,8 @@ pub struct RdbMetadata {
     /// key ordering). Non-UTF-8 AUX keys are rejected as `CorruptData`;
     /// values with non-UTF-8 bytes are passed through lossy conversion.
     pub aux: BTreeMap<String, String>,
+    /// Strict-profile AUX bytes in native order, including duplicate names.
+    pub raw_aux: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl RdbMetadata {
@@ -146,6 +150,11 @@ pub enum RdbValue {
 
     /// Sorted set: (member, score) pairs.
     SortedSet(Vec<(Vec<u8>, f64)>),
+
+    /// Strict-profile original score bytes: binary64 LE for type 5, native
+    /// decimal/special spelling for type 3 or compact encodings. The RDB
+    /// type_code distinguishes the representation; no f64 round trip occurs.
+    SortedSetBytes(Vec<(Vec<u8>, Vec<u8>)>),
 
     /// Hash: field-value pairs with optional per-field TTL.
     Hash(Vec<HashField>),
@@ -287,10 +296,20 @@ pub enum RdbError {
 
     /// Unknown or unsupported RDB type code.
     UnknownType(u8),
+
+    /// A strict-profile encoding cannot be preserved by this consumer.
+    UnsupportedProfile(u8),
+
+    /// An input, allocation, element or work allowance was exhausted, or an allocation failed.
+    ResourceLimit,
 }
 
 impl From<std::io::Error> for RdbError {
     fn from(e: std::io::Error) -> Self {
+        // The strict-profile input/work bound is reported by the bounded reader as OutOfMemory.
+        if e.kind() == std::io::ErrorKind::OutOfMemory {
+            return RdbError::ResourceLimit;
+        }
         RdbError::Io(e)
     }
 }
@@ -303,6 +322,8 @@ impl fmt::Display for RdbError {
             RdbError::UnsupportedVersion(v) => write!(f, "unsupported RDB version: {}", v),
             RdbError::CorruptData(msg) => write!(f, "corrupt RDB data: {}", msg),
             RdbError::UnknownType(t) => write!(f, "unknown RDB type code: {}", t),
+            RdbError::UnsupportedProfile(t) => write!(f, "unsupported strict-profile opcode: {t}"),
+            RdbError::ResourceLimit => write!(f, "resource limit exceeded"),
         }
     }
 }
@@ -313,6 +334,58 @@ impl std::error::Error for RdbError {
             RdbError::Io(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl Zeroize for HashField {
+    fn zeroize(&mut self) {
+        self.field.zeroize();
+        self.value.zeroize();
+        self.expiry_ms.zeroize();
+    }
+}
+#[cfg(feature = "zeroize")]
+impl Zeroize for RdbValue {
+    fn zeroize(&mut self) {
+        match self {
+            Self::String(v) => v.zeroize(),
+            Self::List(v) | Self::Set(v) => v.zeroize(),
+            Self::SortedSet(v) => v.zeroize(),
+            Self::SortedSetBytes(v) => v.zeroize(),
+            Self::Hash(v) => v.zeroize(),
+            Self::Module(v) => {
+                v.module_name.zeroize();
+                for item in &mut v.values {
+                    if let ModuleValue::String(bytes) = item {
+                        bytes.zeroize();
+                    }
+                }
+            }
+            Self::Stream(v) => {
+                for entry in &mut v.entries {
+                    entry.id.zeroize();
+                    entry.fields.zeroize();
+                }
+            }
+        }
+    }
+}
+#[cfg(feature = "zeroize")]
+impl Zeroize for RdbEntry {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+        self.value.zeroize();
+    }
+}
+#[cfg(feature = "zeroize")]
+impl Drop for RdbMetadata {
+    fn drop(&mut self) {
+        for (mut key, mut value) in std::mem::take(&mut self.aux) {
+            key.zeroize();
+            value.zeroize();
+        }
+        self.raw_aux.zeroize();
     }
 }
 

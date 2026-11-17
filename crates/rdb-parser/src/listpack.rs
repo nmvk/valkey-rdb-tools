@@ -10,6 +10,7 @@
 //   [encoding byte(s)] [data bytes...] [backlen (1-5 bytes)]
 
 use crate::compact::{self, sign_extend, CompactEntry};
+use crate::limits;
 use crate::types::RdbError;
 
 fn checked_add(a: usize, b: usize, ctx: &str) -> Result<usize, RdbError> {
@@ -61,7 +62,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
     let capacity = compact::capacity_hint(num_elements, data.len());
 
     let mut pos = LP_HDR_SIZE;
-    let mut entries = Vec::with_capacity(capacity);
+    let mut entries = limits::vector(capacity)?;
 
     loop {
         if pos >= data.len() {
@@ -85,7 +86,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
         }
 
         let (entry, entry_len) = decode_entry(&data[pos..])?;
-        entries.push(entry);
+        limits::push(&mut entries, entry)?;
 
         // Advance past entry data + backlen using checked arithmetic
         let bl_size = backlen_size(entry_len);
