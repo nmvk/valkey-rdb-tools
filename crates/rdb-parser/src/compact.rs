@@ -5,6 +5,8 @@
 // enum, conversion methods, and sign_extend helper.
 
 use crate::types::RdbError;
+#[cfg(feature = "zeroize")]
+use crate::wipe::Zeroize;
 
 /// A single decoded entry from a compact encoding (listpack or ziplist).
 #[derive(Debug, Clone, PartialEq)]
@@ -17,9 +19,11 @@ pub enum CompactEntry {
 
 impl CompactEntry {
     /// Convert entry to bytes: strings pass through, integers become decimal ASCII.
-    pub fn into_bytes(self) -> Vec<u8> {
-        match self {
-            CompactEntry::Str(s) => s,
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        // Take the bytes instead of moving them out: with the `zeroize` feature the entry
+        // implements `Drop`, which forbids moving out of its fields.
+        match &mut self {
+            CompactEntry::Str(s) => std::mem::take(s),
             CompactEntry::Int(n) => n.to_string().into_bytes(),
         }
     }
@@ -96,6 +100,15 @@ pub(crate) fn ensure_len(buf: &[u8], need: usize, format: &str, ctx: &str) -> Re
         )));
     }
     Ok(())
+}
+
+#[cfg(feature = "zeroize")]
+impl Drop for CompactEntry {
+    fn drop(&mut self) {
+        if let Self::Str(v) = self {
+            v.zeroize();
+        }
+    }
 }
 
 #[cfg(test)]

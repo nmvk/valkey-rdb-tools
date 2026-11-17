@@ -2,7 +2,9 @@
 //
 // Reference: valkey/src/lzf_d.c
 
+use crate::limits;
 use crate::types::RdbError;
+use crate::wipe::Zeroizing;
 
 /// Maximum LZF decompression ratio (`expected_len / compressed.len()`).
 /// Prevents a small compressed blob from claiming a huge output buffer.
@@ -26,7 +28,7 @@ pub(crate) fn decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u
             LZF_MAX_RATIO
         )));
     }
-    let mut output = Vec::with_capacity(expected_len);
+    let mut output = Zeroizing::new(limits::vector(expected_len)?);
     let mut i = 0;
 
     while i < compressed.len() {
@@ -102,7 +104,7 @@ pub(crate) fn decompress(compressed: &[u8], expected_len: usize) -> Result<Vec<u
         )));
     }
 
-    Ok(output)
+    Ok(std::mem::take(&mut *output))
 }
 
 #[cfg(test)]

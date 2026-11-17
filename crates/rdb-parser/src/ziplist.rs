@@ -12,6 +12,7 @@
 // String lengths are BIG endian. Integer data is LITTLE endian.
 
 use crate::compact::{self, CompactEntry};
+use crate::limits;
 use crate::types::RdbError;
 
 fn checked_add(a: usize, b: usize, ctx: &str) -> Result<usize, RdbError> {
@@ -49,7 +50,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
     let capacity = compact::capacity_hint(zllen, data.len());
 
     let mut pos = ZL_HDR_SIZE;
-    let mut entries = Vec::with_capacity(capacity);
+    let mut entries = limits::vector(capacity)?;
 
     loop {
         if pos >= data.len() {
@@ -61,7 +62,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<CompactEntry>, RdbError> {
         }
 
         let (entry, consumed) = decode_entry(&data[pos..])?;
-        entries.push(entry);
+        limits::push(&mut entries, entry)?;
 
         pos = pos
             .checked_add(consumed)
@@ -98,7 +99,7 @@ fn decode_entry(buf: &[u8]) -> Result<(CompactEntry, usize), RdbError> {
             let len = (enc & 0x3F) as usize;
             let total = checked_add(1, len, "6-bit string")?;
             ensure_len(rest, total, "6-bit string")?;
-            let s = rest[1..total].to_vec();
+            let s = limits::copy(&rest[1..total])?;
             (CompactEntry::Str(s), total)
         }
 
@@ -108,7 +109,7 @@ fn decode_entry(buf: &[u8]) -> Result<(CompactEntry, usize), RdbError> {
             let len = (((enc & 0x3F) as usize) << 8) | (rest[1] as usize);
             let total = checked_add(2, len, "14-bit string")?;
             ensure_len(rest, total, "14-bit string")?;
-            let s = rest[2..total].to_vec();
+            let s = limits::copy(&rest[2..total])?;
             (CompactEntry::Str(s), total)
         }
 
@@ -127,7 +128,7 @@ fn decode_entry(buf: &[u8]) -> Result<(CompactEntry, usize), RdbError> {
             let len = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
             let total = checked_add(5, len, "32-bit string")?;
             ensure_len(rest, total, "32-bit string")?;
-            let s = rest[5..total].to_vec();
+            let s = limits::copy(&rest[5..total])?;
             (CompactEntry::Str(s), total)
         }
 
